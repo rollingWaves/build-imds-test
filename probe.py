@@ -1,8 +1,8 @@
 """
-Runtime network probe for App Platform cross-app testing.
-Serves probe results on HTTP and runs network discovery on startup.
+Runtime network probe - fast version.
+Serves results on HTTP. Runs quick scan on startup.
 """
-import json, os, socket, time, urllib.request, urllib.error, ssl, re, threading
+import json, os, socket, time, urllib.request, urllib.error, ssl, threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
 results = {"status": "probing..."}
@@ -11,148 +11,130 @@ def run_probe():
     global results
     r = {}
 
-    # 1. Runtime identity
+    # 1. Identity
     r['runtime'] = {
         'uid': os.getuid(),
         'hostname': socket.gethostname(),
         'pid': os.getpid(),
     }
 
-    # Network env vars
-    env_keys = {}
-    for k, v in os.environ.items():
-        if any(x in k.upper() for x in ['KUBE', 'SERVICE', 'HOST', 'PORT', 'IP', 'DNS', 'CLUSTER', 'POD', 'NODE', 'NET', 'DIGITAL', 'APP']):
-            env_keys[k] = v[:200]
-    r['network_env'] = env_keys
+    # Network env
+    r['env'] = {k: v[:200] for k, v in os.environ.items()
+                if any(x in k.upper() for x in ['KUBE', 'SERVICE', 'HOST', 'PORT', 'DNS', 'CLUSTER', 'POD', 'NODE', 'NET', 'DIGITAL', 'APP'])}
 
-    # 2. Own IPs + routes
-    import subprocess as sp
+    # 2. Own IPs
     try:
-        out = sp.run(['ip', 'addr'], capture_output=True, text=True, timeout=5)
-        r['ip_addr'] = out.stdout[:2000]
+        import subprocess as sp
+        r['ip_addr'] = sp.run(['ip', 'addr'], capture_output=True, text=True, timeout=5).stdout[:2000]
+        r['routes'] = sp.run(['ip', 'route'], capture_output=True, text=True, timeout=5).stdout[:500]
     except Exception as e:
-        r['ip_addr_err'] = str(e)
+        r['ip_err'] = str(e)
+
+    # 3. resolv.conf
     try:
-        out = sp.run(['ip', 'route'], capture_output=True, text=True, timeout=5)
-        r['routes'] = out.stdout[:1000]
-    except:
-        pass
-    try:
-        r['resolv_conf'] = open('/etc/resolv.conf').read()[:500]
+        r['resolv'] = open('/etc/resolv.conf').read()
     except:
         pass
 
-    # 3. Namespace / SA token
+    # 4. K8s SA
     r['k8s'] = {}
-    for f in ['namespace', 'token', 'ca.crt']:
-        path = f'/var/run/secrets/kubernetes.io/serviceaccount/{f}'
+    for f in ['namespace', 'token']:
         try:
-            data = open(path).read()
-            if f == 'token':
-                r['k8s'][f] = data[:50] + '...' if len(data) > 50 else data
-            else:
-                r['k8s'][f] = data[:500]
+            data = open(f'/var/run/secrets/kubernetes.io/serviceaccount/{f}').read()
+            r['k8s'][f] = data[:80] + '...' if len(data) > 80 else data
         except Exception as e:
             r['k8s'][f] = str(e)[:100]
 
-    # 4. DNS resolution
+    # 5. DNS
     r['dns'] = {}
-    dns_targets = [
-        'kubernetes.default.svc.cluster.local',
-        'kube-dns.kube-system.svc.cluster.local',
-    ]
-    for target in dns_targets:
+    for target in ['kubernetes.default', 'kube-dns.kube-system.svc.cluster.local']:
         try:
-            r['dns'][target] = [str(x[4]) for x in socket.getaddrinfo(target, None)][:3]
+            r['dns'][target] = socket.gethostbyname(target)
         except Exception as e:
-            r['dns'][target] = str(e)[:100]
+            r['dns'][target] = str(e)[:80]
 
-    # 5. Quick connect helper
-    def qc(ip, port, timeout=1.5):
+    # 6. Quick connectivity tests (just the important ones)
+    def qc(ip, port, t=1):
         try:
             s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            s.settimeout(timeout)
-            result = s.connect_ex((ip, port))
+            s.settimeout(t)
+            rc = s.connect_ex((ip, port))
             s.close()
-            return result
+            return rc
         except:
             return -1
 
-    # 6. Pod CIDR scan (10.244.x.x) — look for other apps
+    r['connectivity'] = {}
+    tests = [
+        ('K8s API', '10.245.0.1', 443),
+        ('IMDS', '169.254.169.254', 80),
+        ('kube-dns', '10.245.0.11', 53),
+    ]
+    for name, ip, port in tests:
+        r['connectivity'][name] = f'errno={qc(ip, port, 2)}'
+
+    # 7. Targeted pod scan - scan OUR subnet and nearby
     r['pod_scan'] = {}
-    ports = [8080, 80, 443, 3000, 5000]
-    for sub in range(0, 15):
-        for host in [1, 2, 3, 4, 5, 10, 20, 50, 100, 150, 200, 250]:
-            ip = f'10.244.{sub}.{host}'
-            for port in ports:
-                rc = qc(ip, port, timeout=0.5)
-                if rc == 0:
-                    r['pod_scan'][f'{ip}:{port}'] = 'OPEN'
-                    # Try HTTP fetch
-                    try:
-                        resp = urllib.request.urlopen(f'http://{ip}:{port}/', timeout=3)
-                        body = resp.read().decode(errors='replace')[:500]
-                        hdrs = dict(resp.headers)
-                        r['pod_scan'][f'{ip}:{port}_resp'] = {'body': body, 'headers': hdrs}
-                    except Exception as e:
-                        r['pod_scan'][f'{ip}:{port}_err'] = str(e)[:200]
-
-    # 7. Service CIDR scan (10.245.x.x)
-    r['svc_scan'] = {}
-    for host in range(1, 30):
-        ip = f'10.245.0.{host}'
-        for port in [443, 80, 8080, 53]:
-            rc = qc(ip, port, timeout=0.5)
-            if rc == 0:
-                r['svc_scan'][f'{ip}:{port}'] = 'OPEN'
-
-    # Also scan 10.245.{1-5}.x
-    for sub in range(1, 6):
-        for host in [1, 10, 50, 100, 150, 200]:
-            ip = f'10.245.{sub}.{host}'
-            for port in [80, 443, 8080]:
-                rc = qc(ip, port, timeout=0.5)
-                if rc == 0:
-                    r['svc_scan'][f'{ip}:{port}'] = 'OPEN'
-
-    # 8. /proc/net/tcp
-    r['connections'] = {}
+    # Get our own IP first
+    own_ip = None
     try:
-        tcp = open('/proc/net/tcp').read()
-        r['connections']['tcp_lines'] = len(tcp.strip().split('\n'))
-        r['connections']['tcp'] = tcp[:2000]
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("8.8.8.8", 80))
+        own_ip = s.getsockname()[0]
+        s.close()
+        r['own_ip'] = own_ip
     except:
         pass
 
-    # 9. Try to reach the K8s API
-    r['k8s_api'] = {}
-    rc = qc('10.245.0.1', 443, timeout=2)
-    r['k8s_api']['connect'] = f'errno={rc}'
-    if rc == 0:
-        try:
-            ctx = ssl.create_default_context()
-            ctx.check_hostname = False
-            ctx.verify_mode = ssl.CERT_NONE
-            req = urllib.request.Request('https://10.245.0.1:443/version')
-            resp = urllib.request.urlopen(req, timeout=5, context=ctx)
-            r['k8s_api']['version'] = resp.read().decode()[:500]
-        except Exception as e:
-            r['k8s_api']['err'] = str(e)[:200]
+    if own_ip and own_ip.startswith('10.244.'):
+        parts = own_ip.split('.')
+        our_sub = int(parts[2])
+        # Scan our subnet + a few nearby
+        for sub in range(max(0, our_sub - 2), min(255, our_sub + 5)):
+            for host in range(1, 255):
+                ip = f'10.244.{sub}.{host}'
+                if ip == own_ip:
+                    continue
+                rc = qc(ip, 8080, 0.3)
+                if rc == 0:
+                    r['pod_scan'][f'{ip}:8080'] = 'OPEN'
+                    try:
+                        resp = urllib.request.urlopen(f'http://{ip}:8080/', timeout=2)
+                        r['pod_scan'][f'{ip}:8080_data'] = resp.read().decode(errors='replace')[:500]
+                    except Exception as e:
+                        r['pod_scan'][f'{ip}:8080_err'] = str(e)[:200]
+                # Also check common ports
+                for p in [80, 443, 3000]:
+                    rc2 = qc(ip, p, 0.3)
+                    if rc2 == 0:
+                        r['pod_scan'][f'{ip}:{p}'] = 'OPEN'
 
-    # 10. Try IMDS
-    r['imds'] = {}
-    rc = qc('169.254.169.254', 80, timeout=2)
-    r['imds']['connect'] = f'errno={rc}'
+    # 8. Service CIDR quick scan
+    r['svc_scan'] = {}
+    for host in range(1, 256):
+        ip = f'10.245.0.{host}'
+        rc = qc(ip, 80, 0.3)
+        if rc == 0:
+            r['svc_scan'][f'{ip}:80'] = 'OPEN'
+        rc = qc(ip, 443, 0.3)
+        if rc == 0:
+            r['svc_scan'][f'{ip}:443'] = 'OPEN'
 
-    # 11. Internal DO ranges
+    # 9. IMDS / internal
     r['internal'] = {}
-    for ip in ['10.116.0.1', '10.116.0.2', '10.116.0.3', '100.65.67.229', '10.10.0.5']:
-        rc = qc(ip, 443, timeout=1)
-        r['internal'][f'{ip}:443'] = f'errno={rc}'
+    for ip, port in [('169.254.169.254', 80), ('10.116.0.1', 443), ('100.64.0.1', 80), ('100.65.67.229', 443)]:
+        r['internal'][f'{ip}:{port}'] = f'errno={qc(ip, port, 1)}'
 
+    # 10. /proc/net/tcp
+    try:
+        r['proc_net_tcp'] = open('/proc/net/tcp').read()[:1500]
+    except:
+        pass
+
+    r['probe_done'] = True
+    r['probe_time'] = time.strftime('%Y-%m-%dT%H:%M:%SZ')
     results = r
 
-# Run probe in background thread
 t = threading.Thread(target=run_probe, daemon=True)
 t.start()
 
