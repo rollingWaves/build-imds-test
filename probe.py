@@ -28,6 +28,8 @@ try:
             procs[pid]['status'] = open(f'/proc/{pid}/status').read()[:500]
         except:
             pass
+except:
+    pass
 r['processes'] = procs
 
 # 3. Check if we can see other build pods' processes via /proc
