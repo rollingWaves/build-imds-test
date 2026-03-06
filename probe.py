@@ -94,7 +94,7 @@ class H(BaseHTTPRequestHandler):
         self.end_headers()
         path = self.path
 
-        if path == '/scan':
+        if path.startswith('/scan'):
             # On-demand scan a specific IP:port via ?ip=x&port=y
             from urllib.parse import urlparse, parse_qs
             qs = parse_qs(urlparse(path).query) if '?' in path else {}
